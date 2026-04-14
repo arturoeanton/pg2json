@@ -13,15 +13,16 @@ import (
 
 // Column captures the parsed RowDescription field plus its compiled encoder.
 type Column struct {
-	Name      string
-	TableOID  uint32
-	AttrNum   int16
-	TypeOID   protocol.OID
-	TypeMod   int32
-	TypeLen   int16
-	Format    int16
-	Encoder   types.Encoder
-	KeyPrefix []byte // pre-built `"name":`
+	Name           string
+	TableOID       uint32
+	AttrNum        int16
+	TypeOID        protocol.OID
+	TypeMod        int32
+	TypeLen        int16
+	Format         int16
+	Encoder        types.Encoder
+	KeyPrefix      []byte // pre-built `"name":`
+	KeyPrefixComma []byte // pre-built `,"name":` for columns > 0
 }
 
 // Plan is the cached per-shape execution plan for a result set.
@@ -128,6 +129,7 @@ func ParseRowDescription(body []byte) (*Plan, error) {
 		// would render hex-looking garbage but never produce invalid JSON.
 		c.Encoder = types.Pick(c.TypeOID)
 		c.KeyPrefix = jsonwriter.AppendKey(nil, name)
+		c.KeyPrefixComma = append([]byte{','}, c.KeyPrefix...)
 	}
 
 	p := &Plan{Columns: cols}

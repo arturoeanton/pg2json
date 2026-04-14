@@ -21,17 +21,27 @@ func AppendObject(dst, body []byte, plan *Plan) ([]byte, error) {
 		return dst, err
 	}
 	dst = append(dst, '{')
-	for i := 0; i < cols; i++ {
+	if cols > 0 {
+		// First column: bare KeyPrefix (no leading comma).
 		raw, rest, err := readColumn(body)
 		if err != nil {
 			return dst, err
 		}
 		body = rest
-		if i > 0 {
-			dst = append(dst, ',')
+		col := &plan.Columns[0]
+		dst = append(dst, col.KeyPrefix...)
+		dst = col.Encoder(dst, raw)
+		// Remaining columns: KeyPrefixComma (leading ',' fused in).
+		for i := 1; i < cols; i++ {
+			raw, rest, err = readColumn(body)
+			if err != nil {
+				return dst, err
+			}
+			body = rest
+			col = &plan.Columns[i]
+			dst = append(dst, col.KeyPrefixComma...)
+			dst = col.Encoder(dst, raw)
 		}
-		dst = append(dst, plan.Columns[i].KeyPrefix...)
-		dst = plan.Columns[i].Encoder(dst, raw)
 	}
 	dst = append(dst, '}')
 	return dst, nil
@@ -44,16 +54,22 @@ func AppendArray(dst, body []byte, plan *Plan) ([]byte, error) {
 		return dst, err
 	}
 	dst = append(dst, '[')
-	for i := 0; i < cols; i++ {
+	if cols > 0 {
 		raw, rest, err := readColumn(body)
 		if err != nil {
 			return dst, err
 		}
 		body = rest
-		if i > 0 {
+		dst = plan.Columns[0].Encoder(dst, raw)
+		for i := 1; i < cols; i++ {
+			raw, rest, err = readColumn(body)
+			if err != nil {
+				return dst, err
+			}
+			body = rest
 			dst = append(dst, ',')
+			dst = plan.Columns[i].Encoder(dst, raw)
 		}
-		dst = plan.Columns[i].Encoder(dst, raw)
 	}
 	dst = append(dst, ']')
 	return dst, nil
