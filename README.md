@@ -246,6 +246,228 @@ correctness-preserving fallback.
 
 ---
 
+## Examples
+
+Copy-paste starting points for the patterns this library is built for.
+All examples assume you have an initialised `*pg2json.Client` called `c`
+or a `*pool.Pool` called `p`. Error handling is abbreviated for clarity;
+in production wrap each call with proper logging / metrics.
+
+### 1. REST endpoint → JSON array
+
+```go
+// GET /api/v1/users?limit=100
+func listUsers(p *pool.Pool) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        c, err := p.Acquire(r.Context())
+        if err != nil {
+            http.Error(w, err.Error(), 503)
+            return
+        }
+        defer c.Release()
+
+        limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+        if limit <= 0 || limit > 1000 { limit = 100 }
+
+        w.Header().Set("Content-Type", "application/json")
+        if err := c.StreamJSON(r.Context(), w,
+            "SELECT id, email, created_at FROM users ORDER BY id DESC LIMIT $1",
+            limit); err != nil {
+            // Headers may already be flushed; we can't change status here.
+            // Observer catches it.
+            return
+        }
+    }
+}
+```
+
+### 2. NDJSON export to S3 / data lake
+
+```go
+func exportToS3(ctx context.Context, p *pool.Pool, bucket, key, sql string) error {
+    c, err := p.Acquire(ctx); if err != nil { return err }
+    defer c.Release()
+
+    pr, pw := io.Pipe()
+    go func() {
+        defer pw.Close()
+        _ = c.StreamNDJSON(ctx, pw, sql)
+    }()
+    _, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+        Bucket: &bucket, Key: &key,
+        Body:   pr,
+        ContentType: aws.String("application/x-ndjson"),
+    })
+    return err
+}
+```
+
+### 3. Server-Sent Events feed
+
+```go
+// Live feed of the last N events, one per SSE "data:" line.
+// FlushInterval guarantees bytes reach the browser within 200ms even if
+// rows trickle.
+func eventsFeed(p *pool.Pool) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "text/event-stream")
+        w.Header().Set("Cache-Control", "no-cache")
+        flusher, _ := w.(http.Flusher)
+
+        c, _ := p.Acquire(r.Context()); defer c.Release()
+
+        // Wrap w so every newline becomes "data: ...\n\n"
+        sw := &sseWriter{w: w, flusher: flusher}
+        _ = c.StreamNDJSON(r.Context(), sw,
+            "SELECT id, payload FROM events WHERE id > $1 ORDER BY id",
+            lastSeenID(r))
+    }
+}
+
+type sseWriter struct { w http.ResponseWriter; flusher http.Flusher }
+func (s *sseWriter) Write(p []byte) (int, error) {
+    _, _ = s.w.Write([]byte("data: "))
+    n, _ := s.w.Write(bytes.TrimRight(p, "\n"))
+    _, _ = s.w.Write([]byte("\n\n"))
+    s.flusher.Flush()
+    return n, nil
+}
+```
+
+### 4. Webhook payload from a SQL query
+
+```go
+func fireWebhook(ctx context.Context, c *pg2json.Client, url string, args ...any) error {
+    body, err := c.QueryJSON(ctx,
+        `SELECT order_id, status, total_cents, currency
+         FROM orders WHERE id = ANY($1::bigint[])`, args...)
+    if err != nil { return err }
+
+    req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+    req.Header.Set("Content-Type", "application/json")
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil { return err }
+    resp.Body.Close()
+    return nil
+}
+```
+
+### 5. Warm a Redis cache with a JSON blob
+
+```go
+func cacheWarm(ctx context.Context, c *pg2json.Client, rdb *redis.Client, userID int64) error {
+    body, err := c.QueryJSON(ctx,
+        "SELECT id, prefs, last_login FROM user_profile WHERE id = $1",
+        userID)
+    if err != nil { return err }
+    // body is already JSON — no json.Marshal round-trip.
+    return rdb.Set(ctx, fmt.Sprintf("user:%d", userID), body, 5*time.Minute).Err()
+}
+```
+
+### 6. GraphQL list resolver
+
+```go
+// Resolver for type Query { orders(limit: Int): [Order!]! }
+// The resolver returns a json.RawMessage; gqlgen / graphql-go both
+// accept this and skip re-serialisation.
+func (r *Resolver) Orders(ctx context.Context, limit *int) (json.RawMessage, error) {
+    c, _ := r.pool.Acquire(ctx); defer c.Release()
+    n := 50; if limit != nil { n = *limit }
+    return c.QueryJSON(ctx,
+        `SELECT id, status, total_cents, customer_id
+         FROM orders ORDER BY created_at DESC LIMIT $1`, n)
+}
+```
+
+### 7. Kafka / PubSub producer (NDJSON messages)
+
+```go
+// Each DB row becomes one Kafka message. Streaming so the producer
+// starts sending before the query finishes.
+func streamToKafka(ctx context.Context, c *pg2json.Client, prod *kafka.Writer, sql string) error {
+    pr, pw := io.Pipe()
+    go func() { defer pw.Close(); _ = c.StreamNDJSON(ctx, pw, sql) }()
+
+    scan := bufio.NewScanner(pr)
+    scan.Buffer(make([]byte, 64*1024), 8*1024*1024) // large rows
+    for scan.Scan() {
+        if err := prod.WriteMessages(ctx,
+            kafka.Message{Value: append([]byte(nil), scan.Bytes()...)},
+        ); err != nil {
+            return err
+        }
+    }
+    return scan.Err()
+}
+```
+
+### 8. Admin panel — arbitrary SELECT with hard caps
+
+```go
+// Gate a user-supplied SELECT with byte/row caps so an admin can't
+// accidentally exfiltrate a 10 GB table through the UI.
+func adminRun(ctx context.Context, sql string) ([]byte, error) {
+    cfg := baseCfg
+    cfg.MaxResponseBytes = 8 << 20   // 8 MB hard cap
+    cfg.MaxResponseRows  = 10_000
+    cfg.DefaultQueryTimeout = 15 * time.Second
+
+    c, err := pg2json.Open(ctx, cfg); if err != nil { return nil, err }
+    defer c.Close()
+
+    buf, err := c.QueryJSON(ctx, sql)
+    var capErr *pg2json.ResponseTooLargeError
+    if errors.As(err, &capErr) {
+        return nil, fmt.Errorf("query too large: %s limit reached (%d)",
+            capErr.Limit, capErr.LimitVal)
+    }
+    return buf, err
+}
+```
+
+### 9. Snapshot / golden test
+
+```go
+func TestOrdersListShape(t *testing.T) {
+    c := openTestClient(t) // from your test helper
+    defer c.Close()
+
+    got, err := c.QueryJSON(context.Background(),
+        `SELECT id, status FROM orders WHERE id IN (1,2,3) ORDER BY id`)
+    if err != nil { t.Fatal(err) }
+
+    want := `[{"id":1,"status":"paid"},{"id":2,"status":"refunded"},{"id":3,"status":"paid"}]`
+    if string(got) != want {
+        t.Fatalf("shape drift\ngot:  %s\nwant: %s", got, want)
+    }
+}
+```
+
+### 10. Graceful shutdown on SIGTERM
+
+```go
+func main() {
+    p, err := pool.New(poolCfg)
+    if err != nil { log.Fatal(err) }
+
+    srv := &http.Server{Addr: ":8080", Handler: mux(p)}
+    go srv.ListenAndServe()
+
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+    <-stop
+
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    _ = srv.Shutdown(ctx)      // stop accepting HTTP requests
+    _ = p.Drain(ctx)           // wait for in-flight queries
+    _ = p.Close()
+}
+```
+
+---
+
 ## Layout
 
 ```
