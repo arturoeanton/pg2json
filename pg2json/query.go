@@ -54,6 +54,8 @@ func (c *Client) abortOversize(capErr *ResponseTooLargeError) error {
 		case protocol.MsgParameterStatus:
 			k, v := splitParameter(body)
 			c.params[k] = v
+		case protocol.MsgNoticeResponse:
+			c.observer.OnNotice(pgerr.Parse(body))
 		}
 	}
 }
@@ -244,11 +246,11 @@ func (c *Client) prepareAndDescribe(sql string) (*preparedStmt, error) {
 			}
 		case protocol.MsgErrorResponse:
 			pgError = pgerr.Parse(body)
-		case protocol.MsgNoticeResponse, protocol.MsgParameterStatus:
-			if t == protocol.MsgParameterStatus {
-				k, v := splitParameter(body)
-				c.params[k] = v
-			}
+		case protocol.MsgNoticeResponse:
+			c.observer.OnNotice(pgerr.Parse(body))
+		case protocol.MsgParameterStatus:
+			k, v := splitParameter(body)
+			c.params[k] = v
 		case protocol.MsgReadyForQuery:
 			if pgError != nil {
 				return nil, pgError
@@ -341,6 +343,7 @@ func (c *Client) bindExecute(out outWriter, mode Mode, st *preparedStmt, args []
 			}
 			st.plan = newPlan
 		case protocol.MsgNoticeResponse:
+			c.observer.OnNotice(pgerr.Parse(body))
 		case protocol.MsgParameterStatus:
 			k, v := splitParameter(body)
 			c.params[k] = v
@@ -405,6 +408,7 @@ func (c *Client) consumeText(out outWriter, mode Mode) error {
 			}
 		case protocol.MsgCommandComplete, protocol.MsgEmptyQueryResponse:
 		case protocol.MsgNoticeResponse:
+			c.observer.OnNotice(pgerr.Parse(body))
 		case protocol.MsgParameterStatus:
 			k, v := splitParameter(body)
 			c.params[k] = v

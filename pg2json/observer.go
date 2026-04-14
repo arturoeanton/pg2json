@@ -13,14 +13,28 @@ import (
 //
 // Implementations MUST be safe for concurrent use even if the Client
 // itself is not (multiple Clients may share one Observer through a Pool).
+//
+// OnNotice is invoked for every server-sent NoticeResponse. Citus surfaces
+// important diagnostics from worker nodes this way (shard rebalance
+// progress, plan warnings, deprecation notices). The *pgerr.Error argument
+// aliases the wire buffer; implementations that keep it past return MUST
+// clone the fields they need.
+//
+// OnQuerySlow is invoked from OnQueryEnd when duration exceeds
+// Config.SlowQueryThreshold (if > 0). It is additive to OnQueryEnd; both
+// fire for the same query. Useful for a dedicated slow-path alerting
+// channel without having to filter every OnQueryEnd event.
 type Observer interface {
 	OnQueryStart(sql string)
 	OnQueryEnd(ev QueryEvent)
+	OnNotice(n *pgerr.Error)
+	OnQuerySlow(ev QueryEvent)
 }
 
 // QueryEvent is the per-query summary delivered to OnQueryEnd. SQLState is
 // "" on success, otherwise the SQLSTATE string returned by the server
-// (e.g. "26000", "57014").
+// (e.g. "26000", "57014"). Retries counts transparent retries performed by
+// the driver (SQLSTATE 26000 re-prepare, SQLSTATE 40xxx retryable class).
 type QueryEvent struct {
 	SQL      string
 	Rows     int
@@ -28,12 +42,15 @@ type QueryEvent struct {
 	Duration time.Duration
 	Err      error
 	SQLState string
+	Retries  int
 }
 
 type noopObserver struct{}
 
-func (noopObserver) OnQueryStart(string)   {}
-func (noopObserver) OnQueryEnd(QueryEvent) {}
+func (noopObserver) OnQueryStart(string)     {}
+func (noopObserver) OnQueryEnd(QueryEvent)   {}
+func (noopObserver) OnNotice(*pgerr.Error)   {}
+func (noopObserver) OnQuerySlow(QueryEvent)  {}
 
 // SetObserver installs the telemetry hook. Pass nil to revert to no-op.
 func (c *Client) SetObserver(o Observer) {
@@ -80,8 +97,14 @@ func (c *Client) recordEnd(sql string, rows, bytes int, dur time.Duration, err e
 			state = pe.Code
 		}
 	}
-	c.observer.OnQueryEnd(QueryEvent{
+	ev := QueryEvent{
 		SQL: sql, Rows: rows, Bytes: bytes,
 		Duration: dur, Err: err, SQLState: state,
-	})
+		Retries: c.lastRetries,
+	}
+	c.observer.OnQueryEnd(ev)
+	if thr := c.cfg.SlowQueryThreshold; thr > 0 && dur >= thr {
+		c.observer.OnQuerySlow(ev)
+	}
+	c.lastRetries = 0
 }

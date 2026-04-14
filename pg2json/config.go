@@ -56,6 +56,32 @@ type Config struct {
 	// MaxResponseRows aborts a query whose row count crosses this value.
 	// Same abort semantics as MaxResponseBytes. 0 = unlimited (default).
 	MaxResponseRows int
+
+	// SlowQueryThreshold triggers Observer.OnQuerySlow in addition to
+	// OnQueryEnd when a query's total duration meets or exceeds it.
+	// 0 = disabled (default).
+	SlowQueryThreshold time.Duration
+
+	// FlushInterval bounds the time the streaming buffer may sit without
+	// being flushed downstream. When > 0, the driver flushes the pending
+	// buffer if this much time elapsed since the last flush, even if the
+	// byte threshold was not reached. Useful for Citus queries whose
+	// first-byte latency is high and whose consumers (HTTP responses,
+	// SSE, NDJSON clients) need steady byte delivery. 0 = disabled.
+	FlushInterval time.Duration
+
+	// Keepalive, if > 0, enables TCP keepalive on dialed connections with
+	// this interval. Default 30s. Idles behind PgBouncer / NAT die
+	// silently without this on long-running sessions.
+	Keepalive time.Duration
+
+	// RetryOnSerialization, if true, transparently retries queries that
+	// fail with SQLSTATE class 40 (serialization_failure, deadlock_detected,
+	// transaction_rollback) when no bytes have been flushed downstream.
+	// Max 3 attempts total, exponential backoff starting at 10ms. Default
+	// false. Citus shard rebalance surfaces 40001 routinely; enable in
+	// environments that run rebalance in production.
+	RetryOnSerialization bool
 }
 
 func (c *Config) applyDefaults() {
@@ -79,6 +105,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ApplicationName == "" {
 		c.ApplicationName = "pg2json"
+	}
+	if c.Keepalive == 0 {
+		c.Keepalive = 30 * time.Second
 	}
 	// SSLMode default is "prefer" — match libpq's historical default. The
 	// connection will silently fall back to plaintext if the server says

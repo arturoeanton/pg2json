@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arturoeanton/pg2json/internal/pgerr"
 	"github.com/arturoeanton/pg2json/pg2json"
 )
 
@@ -142,8 +143,10 @@ func TestObserverFires(t *testing.T) {
 }
 
 type observerFunc struct {
-	start func(string)
-	end   func(pg2json.QueryEvent)
+	start  func(string)
+	end    func(pg2json.QueryEvent)
+	notice func(n *pgerr.Error)
+	slow   func(pg2json.QueryEvent)
 }
 
 func (o observerFunc) OnQueryStart(sql string) {
@@ -154,6 +157,16 @@ func (o observerFunc) OnQueryStart(sql string) {
 func (o observerFunc) OnQueryEnd(e pg2json.QueryEvent) {
 	if o.end != nil {
 		o.end(e)
+	}
+}
+func (o observerFunc) OnNotice(n *pgerr.Error) {
+	if o.notice != nil {
+		o.notice(n)
+	}
+}
+func (o observerFunc) OnQuerySlow(e pg2json.QueryEvent) {
+	if o.slow != nil {
+		o.slow(e)
 	}
 }
 

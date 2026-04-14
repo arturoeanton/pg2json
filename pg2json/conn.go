@@ -39,9 +39,10 @@ type Client struct {
 
 	scram *auth.SCRAM
 
-	observer Observer
-	cnt      counters
-	lastRows int
+	observer    Observer
+	cnt         counters
+	lastRows    int
+	lastRetries int
 }
 
 // Open dials the server and completes the startup handshake.
@@ -156,8 +157,9 @@ func (c *Client) Ping(ctx context.Context) error {
 			return err
 		}
 		switch t {
-		case protocol.MsgEmptyQueryResponse, protocol.MsgCommandComplete,
-			protocol.MsgNoticeResponse:
+		case protocol.MsgEmptyQueryResponse, protocol.MsgCommandComplete:
+		case protocol.MsgNoticeResponse:
+			c.observer.OnNotice(pgerr.Parse(body))
 		case protocol.MsgParameterStatus:
 			k, v := splitParameter(body)
 			c.params[k] = v
@@ -254,7 +256,7 @@ func (c *Client) startup() error {
 		case protocol.MsgErrorResponse:
 			return pgerr.Parse(body)
 		case protocol.MsgNoticeResponse:
-			// drop
+			c.observer.OnNotice(pgerr.Parse(body))
 		case protocol.MsgNegotiateProtocol:
 			// We asked for 3.0; servers that speak 3.x will negotiate
 			// down silently. Accept and continue.
