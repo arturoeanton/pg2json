@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/arturoeanton/pg2json/internal/auth"
 	"github.com/arturoeanton/pg2json/internal/pgerr"
@@ -45,14 +46,27 @@ type Client struct {
 	lastRetries int
 }
 
-// Open dials the server and completes the startup handshake.
+// Open dials the server and completes the startup handshake. The full
+// context (including any deadline) covers the dial, TLS negotiation, and
+// the startup message exchange — not just the TCP connect.
 func Open(ctx context.Context, cfg Config) (*Client, error) {
 	cfg.applyDefaults()
 
-	d := net.Dialer{Timeout: cfg.DialTimeout}
+	d := net.Dialer{
+		Timeout:   cfg.DialTimeout,
+		KeepAlive: cfg.Keepalive, // negative disables; 0 means OS default
+	}
 	nc, err := d.DialContext(ctx, "tcp", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
 	if err != nil {
 		return nil, fmt.Errorf("pg2json: dial: %w", err)
+	}
+	// Push the ctx deadline (or DialTimeout, if ctx has none) into the
+	// socket for the duration of the handshake so reads during TLS / auth
+	// honour cancellation. Cleared before we hand the Client out.
+	if dl, ok := ctx.Deadline(); ok {
+		_ = nc.SetDeadline(dl)
+	} else if cfg.DialTimeout > 0 {
+		_ = nc.SetDeadline(time.Now().Add(cfg.DialTimeout))
 	}
 	c := &Client{
 		cfg:       cfg,
@@ -70,6 +84,9 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		_ = c.conn.Close()
 		return nil, err
 	}
+	// Handshake done; clear the deadline so subsequent query reads are
+	// governed only by per-query context.
+	_ = c.conn.Net().SetDeadline(time.Time{})
 	return c, nil
 }
 
