@@ -2,6 +2,7 @@ package pg2json
 
 import (
 	"io"
+	"time"
 
 	"github.com/arturoeanton/pg2json/internal/bufferpool"
 )
@@ -45,12 +46,15 @@ func (b *bufWriter) Reset()                       { *b.p = (*b.p)[:0] }
 func (b *bufWriter) BytesOut() int                { return len(*b.p) }
 
 // flushingWriter accumulates into a buffer and flushes to the underlying
-// writer once the buffer crosses `threshold`. Because flushes happen between
+// writer once the buffer crosses `threshold` OR `interval` has elapsed
+// since the last flush (if interval > 0). Because flushes happen between
 // row appends, we never split a row across writes — important for NDJSON
 // consumers that scan line-by-line.
 type flushingWriter struct {
 	w         io.Writer
 	threshold int
+	interval  time.Duration
+	lastFlush time.Time
 	buf       []byte
 	src       *[]byte // pool source so we can return it on close
 	committed bool    // any flush has happened
@@ -74,6 +78,9 @@ func (f *flushingWriter) MaybeFlush() error {
 	if len(f.buf) >= f.threshold {
 		return f.Flush()
 	}
+	if f.interval > 0 && len(f.buf) > 0 && time.Since(f.lastFlush) >= f.interval {
+		return f.Flush()
+	}
 	return nil
 }
 
@@ -86,6 +93,9 @@ func (f *flushingWriter) Flush() error {
 		f.committed = true
 		f.written += len(f.buf)
 		f.buf = f.buf[:0]
+	}
+	if f.interval > 0 {
+		f.lastFlush = time.Now()
 	}
 	return nil
 }

@@ -86,22 +86,29 @@ func (c *Client) QueryJSON(ctx context.Context, sql string, args ...any) ([]byte
 
 // StreamJSON streams a JSON array of objects to w.
 func (c *Client) StreamJSON(ctx context.Context, w io.Writer, sql string, args ...any) error {
-	return c.runQuery(ctx, newFlushWriter(w, c.cfg.FlushBytes), ModeArray, sql, args)
+	return c.runQuery(ctx, c.newFlushWriter(w), ModeArray, sql, args)
 }
 
 // StreamNDJSON streams newline-delimited JSON to w.
 func (c *Client) StreamNDJSON(ctx context.Context, w io.Writer, sql string, args ...any) error {
-	return c.runQuery(ctx, newFlushWriter(w, c.cfg.FlushBytes), ModeNDJSON, sql, args)
+	return c.runQuery(ctx, c.newFlushWriter(w), ModeNDJSON, sql, args)
 }
 
 // StreamColumnar streams the columnar form to w.
 func (c *Client) StreamColumnar(ctx context.Context, w io.Writer, sql string, args ...any) error {
-	return c.runQuery(ctx, newFlushWriter(w, c.cfg.FlushBytes), ModeColumnar, sql, args)
+	return c.runQuery(ctx, c.newFlushWriter(w), ModeColumnar, sql, args)
 }
 
-func newFlushWriter(w io.Writer, threshold int) *flushingWriter {
+func (c *Client) newFlushWriter(w io.Writer) *flushingWriter {
 	bp := bufferpool.Get()
-	return &flushingWriter{w: w, threshold: threshold, buf: *bp, src: bp}
+	return &flushingWriter{
+		w:         w,
+		threshold: c.cfg.FlushBytes,
+		interval:  c.cfg.FlushInterval,
+		buf:       *bp,
+		src:       bp,
+		lastFlush: time.Now(),
+	}
 }
 
 func (c *Client) runQuery(ctx context.Context, out outWriter, mode Mode, sql string, args []any) (err error) {
