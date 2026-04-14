@@ -96,6 +96,16 @@ type Config struct {
 	//   2. Config.DefaultQueryTimeout          — gateway default.
 	//   3. ctx.WithTimeout in the HTTP handler — per-request override.
 	DefaultQueryTimeout time.Duration
+
+	// WireReadBufferSize is the size of the bufio.Reader fronting the
+	// network connection. Messages whose total length (5-byte header +
+	// body) fits inside this buffer take a zero-copy fast path via Peek;
+	// larger messages fall back to a copy through an internal scratch
+	// slice. Default 64 KiB, which covers essentially all DataRow /
+	// RowDescription / auth messages. Raise only if you know your
+	// workload returns cells larger than 64 KiB that would otherwise
+	// trigger the copy fallback on every row. Minimum 4 KiB enforced.
+	WireReadBufferSize int
 }
 
 func (c *Config) applyDefaults() {
@@ -122,6 +132,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Keepalive == 0 {
 		c.Keepalive = 30 * time.Second
+	}
+	if c.WireReadBufferSize <= 0 {
+		c.WireReadBufferSize = 64 * 1024
+	} else if c.WireReadBufferSize < 4*1024 {
+		c.WireReadBufferSize = 4 * 1024
 	}
 	// SSLMode default is "prefer" — match libpq's historical default. The
 	// connection will silently fall back to plaintext if the server says

@@ -60,6 +60,13 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pg2json: dial: %w", err)
 	}
+	// Disable Nagle so Bind/Execute/Sync pipelines and small control
+	// messages reach the server without a 40ms ACK-delay penalty.
+	// Postgres wire traffic is request/response; Nagle offers no
+	// coalescing benefit here.
+	if tcp, ok := nc.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 	// Push the ctx deadline (or DialTimeout, if ctx has none) into the
 	// socket for the duration of the handshake so reads during TLS / auth
 	// honour cancellation. Cleared before we hand the Client out.
@@ -70,7 +77,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	c := &Client{
 		cfg:       cfg,
-		conn:      wire.New(nc),
+		conn:      wire.NewSized(nc, cfg.WireReadBufferSize),
 		params:    make(map[string]string, 16),
 		planCache: make(map[string]*rows.Plan, 16),
 		stmts:     newStmtCache(cfg.StmtCacheSize),
