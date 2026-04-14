@@ -499,6 +499,27 @@ design rationale and pending work.
 
 ---
 
+## Build tags
+
+- `pg2json_simd` (experimental) — enables a SWAR (SIMD-Within-A-Register)
+  implementation of JSON string escaping. Pure Go, no assembly, no
+  platform-specific code. Processes 8 bytes per iteration through
+  bitwise tricks on `uint64`. Measured on Apple M4: **4× faster** on
+  medium/long ASCII strings compared to the default scalar
+  implementation; marginal on strings dominated by escape-requiring
+  bytes. Similar speedup expected on x86-64. Off by default because
+  the gain only materialises for text-heavy workloads; numeric
+  queries see no change.
+
+  ```bash
+  go build -tags pg2json_simd ./...
+  go test -tags pg2json_simd ./...
+  ```
+
+  Fuzz tests cover both paths. A real SIMD path (AVX2 / NEON
+  assembly) is a possible future addition; SWAR is the pure-Go
+  stepping stone.
+
 ## Honest limitations
 
 - **No COPY binary fast-export yet.** A `COPY (SELECT ...) TO STDOUT

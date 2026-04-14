@@ -132,6 +132,15 @@
   servers expose features we want.
 - `pgcopy2json` mode that uses COPY binary for absolute bulk-export
   speed.
+- True SIMD JSON string escape (AVX2 on x86-64 + NEON on ARM64) via
+  Go assembly with runtime dispatch. SWAR (under `pg2json_simd`) is
+  the stepping stone; AVX2 would add another ~1.5-2× on the escape
+  hot path, marginal on end-to-end wall time for our benchmarks, more
+  noticeable on very high-QPS text-heavy gateways.
+- Pipeline mode (`SendBatch`-equivalent) — multiple Parse/Bind/Execute
+  groups in flight on a single connection without waiting for each
+  response. Big win for gateways issuing many small queries per
+  request; 0% for single-large-query workloads.
 
 ### Explicitly not planned
 

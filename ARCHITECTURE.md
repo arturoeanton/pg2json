@@ -116,9 +116,37 @@ The hot loop walks the input, accumulates a "copy span", and only
 branches to the slow path when an escapable byte appears. ASCII text
 passes through with one `append`.
 
-Fuzz tests (`FuzzAppendString`, `FuzzAppendStringBytes`,
-`FuzzAppendKey`) exercise millions of inputs per run and guarantee
-the writer never panics on arbitrary bytes and always produces output
+### Optional SWAR escape path
+
+Under the experimental `pg2json_simd` build tag, the scalar
+`AppendStringBody` / `AppendStringBodyBytes` are swapped for a SWAR
+(SIMD-Within-A-Register) implementation that checks 8 bytes at once
+using `uint64` arithmetic. The key primitive is:
+
+```go
+func swarHasEscapable(x uint64) uint64 {
+    // Non-zero if any byte of x is < 0x20, == 0x22, or == 0x5C.
+    lowCtrl := (x - 0x2020...) & ^x & 0x8080...
+    quote   := hasZeroByte(x ^ 0x2222...)
+    slash   := hasZeroByte(x ^ 0x5C5C...)
+    return lowCtrl | quote | slash
+}
+```
+
+When an 8-byte chunk is entirely escape-free the loop advances by 8
+with no per-byte branch. Measured on Apple M4: **~4× faster on
+medium/long ASCII**, ~1.1× on strings with every-4th-byte escapes.
+Zero platform-specific code — compiles everywhere Go does. A real
+AVX2 / NEON assembly path is a possible follow-up; SWAR is the
+pure-Go stepping stone that captures the bulk of the theoretical win
+without per-architecture maintenance.
+
+### Fuzz coverage
+
+`FuzzAppendString`, `FuzzAppendStringBytes`, `FuzzAppendKey`,
+`FuzzParse` (pgerr), and `FuzzParseRowDescription` (rows) run against
+both the scalar and SWAR paths. Millions of inputs per run guarantee
+the writers never panic on arbitrary bytes and always produce output
 that round-trips through `encoding/json` for valid UTF-8.
 
 ## Type encoders
