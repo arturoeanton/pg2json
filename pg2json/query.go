@@ -1,0 +1,439 @@
+package pg2json
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/arturoeanton/pg2json/internal/bufferpool"
+	"github.com/arturoeanton/pg2json/internal/pgerr"
+	"github.com/arturoeanton/pg2json/internal/protocol"
+	"github.com/arturoeanton/pg2json/internal/rows"
+)
+
+// Mode controls the JSON shape produced by the streaming engine.
+type Mode int
+
+const (
+	ModeArray    Mode = iota // [{...},{...}]
+	ModeNDJSON               // {...}\n{...}\n
+	ModeColumnar             // {"columns":[...],"rows":[[...],[...]]}
+)
+
+// QueryJSON runs sql and returns a JSON array of objects in a single
+// allocated slice. For large result sets prefer StreamJSON / StreamNDJSON.
+func (c *Client) QueryJSON(ctx context.Context, sql string, args ...any) ([]byte, error) {
+	bp := bufferpool.Get()
+	defer bufferpool.Put(bp)
+	*bp = (*bp)[:0]
+	w := &bufWriter{p: bp}
+	if err := c.runQuery(ctx, w, ModeArray, sql, args); err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(*bp))
+	copy(out, *bp)
+	return out, nil
+}
+
+// StreamJSON streams a JSON array of objects to w.
+func (c *Client) StreamJSON(ctx context.Context, w io.Writer, sql string, args ...any) error {
+	return c.runQuery(ctx, newFlushWriter(w, c.cfg.FlushBytes), ModeArray, sql, args)
+}
+
+// StreamNDJSON streams newline-delimited JSON to w.
+func (c *Client) StreamNDJSON(ctx context.Context, w io.Writer, sql string, args ...any) error {
+	return c.runQuery(ctx, newFlushWriter(w, c.cfg.FlushBytes), ModeNDJSON, sql, args)
+}
+
+// StreamColumnar streams the columnar form to w.
+func (c *Client) StreamColumnar(ctx context.Context, w io.Writer, sql string, args ...any) error {
+	return c.runQuery(ctx, newFlushWriter(w, c.cfg.FlushBytes), ModeColumnar, sql, args)
+}
+
+func newFlushWriter(w io.Writer, threshold int) *flushingWriter {
+	bp := bufferpool.Get()
+	return &flushingWriter{w: w, threshold: threshold, buf: *bp, src: bp}
+}
+
+func (c *Client) runQuery(ctx context.Context, out outWriter, mode Mode, sql string, args []any) (err error) {
+	if err = rejectNonSelect(sql); err != nil {
+		return err
+	}
+	c.observer.OnQueryStart(sql)
+	start := time.Now()
+	defer func() {
+		c.recordEnd(sql, c.lastRows, out.BytesOut(), time.Since(start), err)
+	}()
+	if err = c.attachContext(ctx); err != nil {
+		return err
+	}
+	defer c.detachContext()
+
+	if c.cfg.StmtCacheSize < 0 && len(args) == 0 {
+		return c.runSimple(out, mode, sql)
+	}
+	return c.runCached(out, mode, sql, args)
+}
+
+// --- Simple Query path ---
+
+func (c *Client) runSimple(out outWriter, mode Mode, sql string) error {
+	b := c.conn.Begin(protocol.MsgQuery)
+	b.CString(sql)
+	if err := b.Send(); err != nil {
+		return err
+	}
+	return c.consumeText(out, mode)
+}
+
+// --- Cached extended path ---
+//
+// First call for a given SQL:
+//   Parse(name) | Describe Statement(name) | Sync
+//   -> ParseComplete, ParameterDescription, RowDescription, ReadyForQuery
+//   build plan with binary result formats for known OIDs
+//   Bind(name, formats) | Execute | Sync
+//   -> BindComplete, DataRow*, CommandComplete, ReadyForQuery
+//
+// Subsequent calls hit the cache and skip Parse/Describe entirely.
+//
+// PgBouncer-txn safety: PgBouncer in transaction mode can rotate the
+// physical backend between transactions. A cached statement name from a
+// previous transaction will not exist on the new backend and Bind will
+// fail with SQLSTATE 26000 (invalid_sql_statement_name). We detect that
+// specific error, invalidate the cache entry, and retry exactly once with
+// a fresh Parse — but only if no output bytes have been flushed to the
+// caller yet. If anything was already committed downstream, we surface
+// the error so the caller can react (the partial JSON is, by then,
+// downstream's problem to discard).
+func (c *Client) runCached(out outWriter, mode Mode, sql string, args []any) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		st := c.stmts.get(sql)
+		fromCache := st != nil
+		if st == nil {
+			var err error
+			st, err = c.prepareAndDescribe(sql)
+			if err != nil {
+				c.stmts.invalidate(sql)
+				return err
+			}
+			c.stmts.put(sql, st)
+		}
+		err := c.bindExecute(out, mode, st, args)
+		if err == nil {
+			return nil
+		}
+		if attempt == 0 && fromCache && isStaleStmtError(err) && !out.Committed() {
+			// Backend rotated under us (PgBouncer-txn). Drop the cached
+			// name, reset the un-flushed output, and retry from Parse.
+			c.stmts.invalidate(sql)
+			out.Reset()
+			continue
+		}
+		return err
+	}
+	return nil
+}
+
+// isStaleStmtError reports whether err is a PostgreSQL "prepared statement
+// does not exist" error (SQLSTATE 26000). That's the diagnostic PgBouncer
+// triggers after a backend rotation in transaction mode.
+func isStaleStmtError(err error) bool {
+	pe, ok := err.(*pgerr.Error)
+	if !ok {
+		return false
+	}
+	return pe.Code == "26000"
+}
+
+// prepareAndDescribe runs Parse + Describe Statement + Sync and reads back
+// the column metadata.
+func (c *Client) prepareAndDescribe(sql string) (*preparedStmt, error) {
+	name := c.stmts.nextName()
+
+	// Drain any pending Close messages from previous evictions in the
+	// same network packet.
+	for _, dead := range c.stmts.takePendingClose() {
+		cl := c.conn.Begin(protocol.MsgClose)
+		cl.Byte('S')
+		cl.CString(dead)
+		if err := cl.Send(); err != nil {
+			return nil, err
+		}
+	}
+
+	p := c.conn.Begin(protocol.MsgParse)
+	p.CString(name)
+	p.CString(sql)
+	p.Int16(0) // 0 parameter type OIDs (server infers)
+	if err := p.Send(); err != nil {
+		return nil, err
+	}
+	d := c.conn.Begin(protocol.MsgDescribe)
+	d.Byte('S')
+	d.CString(name)
+	if err := d.Send(); err != nil {
+		return nil, err
+	}
+	if err := c.conn.Begin(protocol.MsgSync).Send(); err != nil {
+		return nil, err
+	}
+
+	var plan *rows.Plan
+	var pgError *pgerr.Error
+	for {
+		t, body, err := c.conn.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		switch t {
+		case protocol.MsgParseComplete, protocol.MsgParameterDescription,
+			protocol.MsgCloseComplete, protocol.MsgNoData:
+			// ignore: bookkeeping
+		case protocol.MsgRowDescription:
+			plan, err = rows.ParseRowDescription(body)
+			if err != nil {
+				return nil, err
+			}
+		case protocol.MsgErrorResponse:
+			pgError = pgerr.Parse(body)
+		case protocol.MsgNoticeResponse, protocol.MsgParameterStatus:
+			if t == protocol.MsgParameterStatus {
+				k, v := splitParameter(body)
+				c.params[k] = v
+			}
+		case protocol.MsgReadyForQuery:
+			if pgError != nil {
+				return nil, pgError
+			}
+			if plan == nil {
+				return nil, fmt.Errorf("pg2json: prepare returned no row description")
+			}
+			fmts := rows.PickResultFormats(plan.Columns)
+			plan.ApplyFormats(fmts)
+			return &preparedStmt{name: name, plan: plan, resultFmts: fmts}, nil
+		default:
+			return nil, fmt.Errorf("pg2json: unexpected msg %q during describe", t)
+		}
+	}
+}
+
+func (c *Client) bindExecute(out outWriter, mode Mode, st *preparedStmt, args []any) error {
+	bd := c.conn.Begin(protocol.MsgBind)
+	bd.CString("")        // portal
+	bd.CString(st.name)   // statement
+	bd.Int16(0)           // all params text
+	bd.Int16(int16(len(args)))
+	for _, a := range args {
+		s, isNull, err := encodeArg(a)
+		if err != nil {
+			return err
+		}
+		if isNull {
+			bd.Int32(-1)
+		} else {
+			bd.Int32(int32(len(s)))
+			bd.String(s)
+		}
+	}
+	// Per-column result format codes.
+	bd.Int16(int16(len(st.resultFmts)))
+	for _, f := range st.resultFmts {
+		bd.Int16(f)
+	}
+	if err := bd.Send(); err != nil {
+		return err
+	}
+	ex := c.conn.Begin(protocol.MsgExecute)
+	ex.CString("")
+	ex.Int32(0)
+	if err := ex.Send(); err != nil {
+		return err
+	}
+	if err := c.conn.Begin(protocol.MsgSync).Send(); err != nil {
+		return err
+	}
+
+	rowCount := 0
+	bindOK := false
+	headerWritten := false
+	var pgError *pgerr.Error
+	for {
+		t, body, err := c.conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		switch t {
+		case protocol.MsgBindComplete:
+			// Bind succeeded — only now is it safe to start writing
+			// output bytes. If Bind fails (e.g. SQLSTATE 26000 on
+			// PgBouncer rotation), the buffer is still pristine and the
+			// retry path can Reset() it cleanly.
+			bindOK = true
+		case protocol.MsgDataRow:
+			if !headerWritten {
+				if err := writeHeader(out, mode, st.plan); err != nil {
+					return err
+				}
+				headerWritten = true
+			}
+			if err := writeRow(out, mode, st.plan, body, rowCount); err != nil {
+				return err
+			}
+			rowCount++
+		case protocol.MsgCommandComplete, protocol.MsgEmptyQueryResponse,
+			protocol.MsgPortalSuspended, protocol.MsgCloseComplete:
+		case protocol.MsgRowDescription:
+			newPlan, err := rows.ParseRowDescriptionForFormats(body, st.resultFmts)
+			if err != nil {
+				return err
+			}
+			st.plan = newPlan
+		case protocol.MsgNoticeResponse:
+		case protocol.MsgParameterStatus:
+			k, v := splitParameter(body)
+			c.params[k] = v
+		case protocol.MsgErrorResponse:
+			pgError = pgerr.Parse(body)
+		case protocol.MsgReadyForQuery:
+			c.lastRows = rowCount
+			if pgError != nil {
+				return pgError
+			}
+			_ = bindOK // BindComplete is implied by reaching here without error
+			if !headerWritten {
+				if err := writeHeader(out, mode, st.plan); err != nil {
+					return err
+				}
+			}
+			if err := writeFooter(out, mode); err != nil {
+				return err
+			}
+			return out.Flush()
+		default:
+			return fmt.Errorf("pg2json: unexpected msg %q during execute", t)
+		}
+	}
+}
+
+// consumeText is used by the simple-query path. RowDescription always
+// arrives in text format here.
+func (c *Client) consumeText(out outWriter, mode Mode) error {
+	var plan *rows.Plan
+	rowCount := 0
+	headerWritten := false
+	var pgError *pgerr.Error
+	for {
+		t, body, err := c.conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		switch t {
+		case protocol.MsgRowDescription:
+			plan, err = rows.ParseRowDescription(body)
+			if err != nil {
+				return err
+			}
+		case protocol.MsgDataRow:
+			if plan == nil {
+				return fmt.Errorf("pg2json: DataRow before RowDescription")
+			}
+			if !headerWritten {
+				if err := writeHeader(out, mode, plan); err != nil {
+					return err
+				}
+				headerWritten = true
+			}
+			if err := writeRow(out, mode, plan, body, rowCount); err != nil {
+				return err
+			}
+			rowCount++
+		case protocol.MsgCommandComplete, protocol.MsgEmptyQueryResponse:
+		case protocol.MsgNoticeResponse:
+		case protocol.MsgParameterStatus:
+			k, v := splitParameter(body)
+			c.params[k] = v
+		case protocol.MsgErrorResponse:
+			pgError = pgerr.Parse(body)
+		case protocol.MsgReadyForQuery:
+			c.lastRows = rowCount
+			if pgError != nil {
+				return pgError
+			}
+			if !headerWritten {
+				p := plan
+				if p == nil {
+					p = &rows.Plan{ColumnsArrayHeader: []byte(`{"columns":[],"rows":[`)}
+				}
+				if err := writeHeader(out, mode, p); err != nil {
+					return err
+				}
+			}
+			if err := writeFooter(out, mode); err != nil {
+				return err
+			}
+			return out.Flush()
+		default:
+			return fmt.Errorf("pg2json: unexpected msg %q during simple query", t)
+		}
+	}
+}
+
+func writeHeader(out outWriter, mode Mode, plan *rows.Plan) error {
+	switch mode {
+	case ModeArray:
+		return out.WriteByte('[')
+	case ModeNDJSON:
+		return nil
+	case ModeColumnar:
+		_, err := out.Write(plan.ColumnsArrayHeader)
+		return err
+	}
+	return nil
+}
+
+func writeRow(out outWriter, mode Mode, plan *rows.Plan, body []byte, idx int) error {
+	scratch := out.Buf()
+	switch mode {
+	case ModeArray:
+		if idx > 0 {
+			scratch = append(scratch, ',')
+		}
+		var err error
+		scratch, err = rows.AppendObject(scratch, body, plan)
+		if err != nil {
+			return err
+		}
+	case ModeNDJSON:
+		var err error
+		scratch, err = rows.AppendObject(scratch, body, plan)
+		if err != nil {
+			return err
+		}
+		scratch = append(scratch, '\n')
+	case ModeColumnar:
+		if idx > 0 {
+			scratch = append(scratch, ',')
+		}
+		var err error
+		scratch, err = rows.AppendArray(scratch, body, plan)
+		if err != nil {
+			return err
+		}
+	}
+	out.SetBuf(scratch)
+	return out.MaybeFlush()
+}
+
+func writeFooter(out outWriter, mode Mode) error {
+	switch mode {
+	case ModeArray:
+		return out.WriteByte(']')
+	case ModeColumnar:
+		_, err := out.Write([]byte("]}"))
+		return err
+	}
+	return nil
+}
+
