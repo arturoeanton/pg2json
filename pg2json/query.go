@@ -167,6 +167,21 @@ func (c *Client) runQuery(ctx context.Context, out outWriter, mode Mode, sql str
 	}
 }
 
+// allBinary reports whether every format code in fmts is 1 (binary).
+// When true the Bind message can use the shorthand "one code for all
+// columns" form.
+func allBinary(fmts []int16) bool {
+	if len(fmts) == 0 {
+		return false
+	}
+	for _, f := range fmts {
+		if f != 1 {
+			return false
+		}
+	}
+	return true
+}
+
 // isRetryableSerialization reports whether err is a PostgreSQL class-40
 // error the driver may retry: serialization_failure (40001) and
 // deadlock_detected (40P01). Other 40xxx codes (e.g. 40002
@@ -257,31 +272,25 @@ func isStaleStmtError(err error) bool {
 func (c *Client) prepareAndDescribe(sql string) (*preparedStmt, error) {
 	name := c.stmts.nextName()
 
-	// Drain any pending Close messages from previous evictions in the
-	// same network packet.
+	// Drain any pending Close messages from previous evictions, then
+	// append Parse + Describe + Sync — all in one TCP write.
 	for _, dead := range c.stmts.takePendingClose() {
 		cl := c.conn.Begin(protocol.MsgClose)
 		cl.Byte('S')
 		cl.CString(dead)
-		if err := cl.Send(); err != nil {
-			return nil, err
-		}
+		cl.Finish()
 	}
-
 	p := c.conn.Begin(protocol.MsgParse)
 	p.CString(name)
 	p.CString(sql)
 	p.Int16(0) // 0 parameter type OIDs (server infers)
-	if err := p.Send(); err != nil {
-		return nil, err
-	}
+	p.Finish()
 	d := c.conn.Begin(protocol.MsgDescribe)
 	d.Byte('S')
 	d.CString(name)
-	if err := d.Send(); err != nil {
-		return nil, err
-	}
-	if err := c.conn.Begin(protocol.MsgSync).Send(); err != nil {
+	d.Finish()
+	c.conn.Begin(protocol.MsgSync).Finish()
+	if err := c.conn.Flush(); err != nil {
 		return nil, err
 	}
 
@@ -342,21 +351,29 @@ func (c *Client) bindExecute(out outWriter, mode Mode, st *preparedStmt, args []
 			bd.String(s)
 		}
 	}
-	// Per-column result format codes.
-	bd.Int16(int16(len(st.resultFmts)))
-	for _, f := range st.resultFmts {
-		bd.Int16(f)
+	// Per-column result format codes. If every column wants binary, send
+	// a single "1" code which the server applies to all columns — saves
+	// 2*(N-1) bytes on the Bind.
+	if allBinary(st.resultFmts) {
+		bd.Int16(1)
+		bd.Int16(1)
+	} else {
+		bd.Int16(int16(len(st.resultFmts)))
+		for _, f := range st.resultFmts {
+			bd.Int16(f)
+		}
 	}
-	if err := bd.Send(); err != nil {
-		return err
-	}
+	bd.Finish()
+	// Pipeline Execute and Sync into the same TCP write — one syscall
+	// instead of three. Nagle is off, so otherwise we'd pay a small
+	// per-message overhead and, on high-latency links, per-packet ACK
+	// cost.
 	ex := c.conn.Begin(protocol.MsgExecute)
 	ex.CString("")
 	ex.Int32(0)
-	if err := ex.Send(); err != nil {
-		return err
-	}
-	if err := c.conn.Begin(protocol.MsgSync).Send(); err != nil {
+	ex.Finish()
+	c.conn.Begin(protocol.MsgSync).Finish()
+	if err := c.conn.Flush(); err != nil {
 		return err
 	}
 
