@@ -118,10 +118,51 @@ func (c *Client) runQuery(ctx context.Context, out outWriter, mode Mode, sql str
 	}
 	defer c.detachContext()
 
-	if c.cfg.StmtCacheSize < 0 && len(args) == 0 {
-		return c.runSimple(out, mode, sql)
+	// Outer retry loop for SQLSTATE class 40 (serialization_failure,
+	// deadlock_detected). Citus surfaces these routinely during shard
+	// rebalance and they are safe to retry provided no bytes have been
+	// flushed downstream yet. Inner paths keep their own retry logic for
+	// SQLSTATE 26000 (PgBouncer backend rotation).
+	const maxRetries = 3
+	backoff := 10 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		if c.cfg.StmtCacheSize < 0 && len(args) == 0 {
+			err = c.runSimple(out, mode, sql)
+		} else {
+			err = c.runCached(out, mode, sql, args)
+		}
+		if err == nil || !c.cfg.RetryOnSerialization {
+			return err
+		}
+		if attempt+1 >= maxRetries || !isRetryableSerialization(err) || out.Committed() {
+			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return err
+		}
+		out.Reset()
+		c.lastRetries++
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(backoff):
+		}
+		backoff *= 2
 	}
-	return c.runCached(out, mode, sql, args)
+}
+
+// isRetryableSerialization reports whether err is a PostgreSQL class-40
+// error the driver may retry: serialization_failure (40001) and
+// deadlock_detected (40P01). Other 40xxx codes (e.g. 40002
+// transaction_integrity_constraint_violation, 40003
+// statement_completion_unknown) are NOT retried — the first is a data
+// problem and the second leaves server state ambiguous.
+func isRetryableSerialization(err error) bool {
+	pe, ok := err.(*pgerr.Error)
+	if !ok {
+		return false
+	}
+	return pe.Code == "40001" || pe.Code == "40P01"
 }
 
 // --- Simple Query path ---
