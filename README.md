@@ -105,27 +105,27 @@ Comparison is against `pgx.Query` + `rows.Values()` + `map[string]any` +
 `json.Marshal` — the only pgx path that works for a dynamic gateway where
 the SQL and column types are unknown at compile time.
 
-| shape       | pg2json                 | pgx + Values + map + Marshal | speedup  | allocs ratio |
-|-------------|-------------------------|------------------------------|----------|--------------|
-| narrow_int  | 13.0 ms, 99.0 MB/s, 6 allocs | 33.2 ms, 38.8 MB/s, 999,804 allocs | **2.55×** | **166,634×** |
-| mixed_5col  | 57.8 ms, 151.5 MB/s, 6 allocs | 121.8 ms, 71.1 MB/s, 3,299,986 allocs | **2.11×** | **549,998×** |
-| wide_jsonb  | 40.7 ms, 127.6 MB/s, 6 allocs | 136.6 ms, 32.9 MB/s, 3,399,951 allocs | **3.36×** | **566,659×** |
-| array_int   | 53.8 ms, 148.2 MB/s, 6 allocs | 139.0 ms, 57.4 MB/s, 4,497,464 allocs | **2.58×** | **749,577×** |
-| null_heavy  | 20.2 ms, 125.3 MB/s, 6 allocs | 43.6 ms, 58.2 MB/s, 1,299,817 allocs | **2.16×** | **216,636×** |
+| shape       | pg2json                       | pgx + Values + map + Marshal        | speedup  | allocs ratio |
+|-------------|-------------------------------|-------------------------------------|----------|--------------|
+| narrow_int  | 13.1 ms, 98.4 MB/s, 6 allocs  | 33.3 ms, 38.7 MB/s, 999,805 allocs  | **2.54×** | **166,634×** |
+| mixed_5col  | 57.7 ms, 151.7 MB/s, 6 allocs | 122.0 ms, 71.0 MB/s, 3,299,992 allocs | **2.11×** | **549,999×** |
+| wide_jsonb  | 41.5 ms, 125.0 MB/s, 6 allocs | 137.1 ms, 32.7 MB/s, 3,399,953 allocs | **3.30×** | **566,659×** |
+| array_int   | 53.7 ms, 148.5 MB/s, 6 allocs | 139.5 ms, 57.2 MB/s, 4,497,476 allocs | **2.60×** | **749,579×** |
+| null_heavy  | 19.4 ms, 130.7 MB/s, 6 allocs | 43.1 ms, 58.8 MB/s, 1,299,816 allocs | **2.22×** | **216,636×** |
 
 **Average: 2.55× faster throughput, ~450,000× fewer allocations.**
 
 ### Direct PG (reference, no PgBouncer)
 
-| shape       | pg2json                  | pgx + Values + map + Marshal |
-|-------------|--------------------------|------------------------------|
-| narrow_int  | 12.9 ms, 99.8 MB/s       | 32.9 ms, 39.2 MB/s           |
-| mixed_5col  | 53.8 ms, 162.7 MB/s      | 120.5 ms, 71.9 MB/s          |
-| wide_jsonb  | 38.7 ms, 134.1 MB/s      | 138.1 ms, 32.5 MB/s          |
-| array_int   | 48.5 ms, 164.6 MB/s      | 128.8 ms, 62.0 MB/s          |
-| null_heavy  | 18.4 ms, 137.4 MB/s      | 41.7 ms, 60.8 MB/s           |
+| shape       | pg2json                   | pgx + Values + map + Marshal        |
+|-------------|---------------------------|-------------------------------------|
+| narrow_int  | 13.1 ms, 98.5 MB/s        | 33.2 ms, 38.8 MB/s                  |
+| mixed_5col  | 53.5 ms, 163.8 MB/s       | 119.8 ms, 72.3 MB/s                 |
+| wide_jsonb  | 38.5 ms, 134.7 MB/s       | 136.7 ms, 32.9 MB/s                 |
+| array_int   | 49.5 ms, 161.1 MB/s       | 134.8 ms, 59.2 MB/s                 |
+| null_heavy  | 18.4 ms, 138.0 MB/s       | 42.2 ms, 60.0 MB/s                  |
 
-PgBouncer overhead vs direct: 1–7%, matching the historical baseline.
+PgBouncer overhead vs direct: 1–8%, matching the historical baseline.
 
 ### Ceiling: vs hand-tuned pgx
 
@@ -184,7 +184,8 @@ p, _ := pool.New(pool.Config{
         SlowQueryThreshold:   250 * time.Millisecond,
         RetryOnSerialization: true,              // enable if Citus rebalance is routine
     },
-    MaxConns: 32,
+    MaxConns:            32,
+    MaxInFlightBuffers:  256, // soft cap on scratch buffers; bursts bypass the pool
 })
 defer p.Close()
 
@@ -506,11 +507,12 @@ design rationale and pending work.
 - **Numeric is text-format only.** PG's binary numeric format is a packed
   decimal requiring non-trivial decoding; text works correctly (the PG
   text form is already JSON-number-shaped).
-- **No fuzz tests yet** for the JSON writer or protocol parser. Planned.
-- **Buffer pool has no global cap.** A sustained burst can grow the pool
-  arbitrarily. Planned, not critical for steady-state load.
 - **Performance claims are against the specific workload shape
   measured.** Run `cmd/pg2json_bench` and `tests/BenchmarkPgx` on your
   own data shapes, on your own hardware. Numbers move.
 - **This is a SELECT driver.** INSERT/UPDATE/DELETE/LISTEN/COPY/replication
   are rejected at the API or not implemented. That's the point.
+- **No 8-hour / 500k-user soak test yet.** Design targets that workload,
+  and the benchmark suite plus fuzz tests cover correctness under
+  bursts, but real-world validation is pending. Pin to `v0.x` and
+  report anything that looks off.

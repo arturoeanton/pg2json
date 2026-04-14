@@ -167,9 +167,9 @@ Done this session:
 
 Still pending:
 
-- **Buffer pool global cap** — today the pool grows unbounded during a
-  burst.
-- **Fuzz tests** for the JSON writer and the protocol parser.
+- Real 8h / 500k-user soak validation (shadow traffic in production).
+- COPY binary fast-export path (P2).
+- Numeric binary decoder (P2).
 
 ## Known gaps (P2, deliberate)
 
