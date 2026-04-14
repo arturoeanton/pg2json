@@ -95,6 +95,9 @@ func ParseRowDescription(body []byte) (*Plan, error) {
 		return nil, fmt.Errorf("rows: short RowDescription")
 	}
 	n := int(int16(binary.BigEndian.Uint16(body[:2])))
+	if n < 0 {
+		return nil, fmt.Errorf("rows: negative field count %d", n)
+	}
 	body = body[2:]
 
 	cols := make([]Column, n)
