@@ -12,6 +12,52 @@ import (
 	"github.com/arturoeanton/pg2json/internal/rows"
 )
 
+// checkCaps returns a non-nil *ResponseTooLargeError if either cap was
+// crossed. Hot-path: one branch each, no allocs unless tripped.
+func (c *Client) checkCaps(out outWriter, rowCount int) *ResponseTooLargeError {
+	if max := c.cfg.MaxResponseRows; max > 0 && rowCount >= max {
+		return &ResponseTooLargeError{
+			Limit: "rows", LimitVal: int64(max),
+			Observed: int64(rowCount), Committed: out.Committed(),
+		}
+	}
+	if max := c.cfg.MaxResponseBytes; max > 0 {
+		if got := int64(out.BytesOut()); got >= max {
+			return &ResponseTooLargeError{
+				Limit: "bytes", LimitVal: max,
+				Observed: got, Committed: out.Committed(),
+			}
+		}
+	}
+	return nil
+}
+
+// abortOversize fires a server-side CancelRequest, drains the wire until
+// ReadyForQuery so the connection is reusable, and returns the cap error.
+// Any ErrorResponse received during the drain (typically SQLSTATE 57014
+// query_canceled) is discarded — the cap is the cause we surface.
+func (c *Client) abortOversize(capErr *ResponseTooLargeError) error {
+	cancelCtx, ccancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = c.SendCancel(cancelCtx)
+	ccancel()
+	for {
+		t, body, err := c.conn.ReadMessage()
+		if err != nil {
+			// Wire died; the connection is unusable, but the cap error is
+			// still the right thing to report. Pool's Discard path will
+			// retire this conn.
+			return capErr
+		}
+		switch t {
+		case protocol.MsgReadyForQuery:
+			return capErr
+		case protocol.MsgParameterStatus:
+			k, v := splitParameter(body)
+			c.params[k] = v
+		}
+	}
+}
+
 // Mode controls the JSON shape produced by the streaming engine.
 type Mode int
 
@@ -282,6 +328,10 @@ func (c *Client) bindExecute(out outWriter, mode Mode, st *preparedStmt, args []
 				return err
 			}
 			rowCount++
+			if capErr := c.checkCaps(out, rowCount); capErr != nil {
+				c.lastRows = rowCount
+				return c.abortOversize(capErr)
+			}
 		case protocol.MsgCommandComplete, protocol.MsgEmptyQueryResponse,
 			protocol.MsgPortalSuspended, protocol.MsgCloseComplete:
 		case protocol.MsgRowDescription:
@@ -349,6 +399,10 @@ func (c *Client) consumeText(out outWriter, mode Mode) error {
 				return err
 			}
 			rowCount++
+			if capErr := c.checkCaps(out, rowCount); capErr != nil {
+				c.lastRows = rowCount
+				return c.abortOversize(capErr)
+			}
 		case protocol.MsgCommandComplete, protocol.MsgEmptyQueryResponse:
 		case protocol.MsgNoticeResponse:
 		case protocol.MsgParameterStatus:

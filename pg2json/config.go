@@ -46,6 +46,16 @@ type Config struct {
 	// SNI, ALPN, etc. Mutually exclusive with SSLMode in practice — if
 	// non-nil, SSLMode only decides whether TLS is required vs preferred.
 	TLSConfig *tls.Config
+
+	// MaxResponseBytes aborts a query whose JSON output crosses this many
+	// bytes. The driver issues a CancelRequest and returns
+	// *ResponseTooLargeError. 0 = unlimited (default). Counted across
+	// already-flushed bytes plus the in-memory tail, so the bound is on
+	// the total response, not the per-flush chunk.
+	MaxResponseBytes int64
+	// MaxResponseRows aborts a query whose row count crosses this value.
+	// Same abort semantics as MaxResponseBytes. 0 = unlimited (default).
+	MaxResponseRows int
 }
 
 func (c *Config) applyDefaults() {
