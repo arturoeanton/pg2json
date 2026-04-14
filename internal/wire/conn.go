@@ -5,6 +5,7 @@
 package wire
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,8 +23,20 @@ const (
 
 // Conn wraps a net.Conn with a single growable read buffer and a small
 // write buffer for building outgoing messages.
+//
+// Reads go through a bufio.Reader sized at readerBufSize. With narrow
+// rows (a single int4 column) each DataRow is ~11–13 bytes over the wire;
+// raw net.Conn reads would translate to ~2 syscalls per row. The
+// bufio layer amortizes that to one syscall per ~4 KB of wire traffic,
+// which is the difference between ~20 MB/s and ~100 MB/s of JSON output
+// on small-row queries. The read buffer is still the growable `readBuf`
+// below — that's the slice we alias into and return from ReadMessage;
+// the bufio just feeds it from userspace, not from the kernel each time.
+const readerBufSize = 32 * 1024
+
 type Conn struct {
 	nc       net.Conn
+	br       *bufio.Reader
 	readBuf  []byte
 	writeBuf []byte
 	hdr      [5]byte
@@ -32,6 +45,7 @@ type Conn struct {
 func New(nc net.Conn) *Conn {
 	return &Conn{
 		nc:       nc,
+		br:       bufio.NewReaderSize(nc, readerBufSize),
 		readBuf:  make([]byte, minRead),
 		writeBuf: make([]byte, 0, 1024),
 	}
@@ -41,10 +55,18 @@ func (c *Conn) Net() net.Conn { return c.nc }
 
 // SwapNet replaces the underlying connection (used after the TLS upgrade).
 // The scratch buffers are kept.
-func (c *Conn) SwapNet(nc net.Conn) { c.nc = nc }
+func (c *Conn) SwapNet(nc net.Conn) {
+	c.nc = nc
+	// Re-bind the buffered reader to the new (TLS-wrapped) conn. Any
+	// pre-buffered bytes from the previous conn are discarded — this is
+	// only called immediately after the 'S'/'N' reply byte, before any
+	// other reads.
+	c.br = bufio.NewReaderSize(nc, readerBufSize)
+}
 
 // ReadByte reads exactly one byte. Used for the SSLRequest reply, which
-// returns 'S' or 'N' without any framing.
+// returns 'S' or 'N' without any framing. Reads bypass the bufio layer
+// since this happens before any framed traffic.
 func (c *Conn) ReadByte() (byte, error) {
 	var b [1]byte
 	if _, err := io.ReadFull(c.nc, b[:]); err != nil {
@@ -59,7 +81,7 @@ func (c *Conn) Close() error { return c.nc.Close() }
 // (without the 4-byte length prefix). The returned slice aliases an
 // internal buffer and is invalidated by the next ReadMessage call.
 func (c *Conn) ReadMessage() (byte, []byte, error) {
-	if _, err := io.ReadFull(c.nc, c.hdr[:5]); err != nil {
+	if _, err := io.ReadFull(c.br, c.hdr[:5]); err != nil {
 		return 0, nil, err
 	}
 	t := c.hdr[0]
@@ -80,7 +102,7 @@ func (c *Conn) ReadMessage() (byte, []byte, error) {
 		c.readBuf = make([]byte, newCap)
 	}
 	body := c.readBuf[:bodyLen]
-	if _, err := io.ReadFull(c.nc, body); err != nil {
+	if _, err := io.ReadFull(c.br, body); err != nil {
 		return 0, nil, err
 	}
 	return t, body, nil

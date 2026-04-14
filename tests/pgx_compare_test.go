@@ -1,22 +1,29 @@
-// pgx comparison benchmarks. Requires PG2JSON_TEST_DSN pointed at a
-// reachable Postgres (direct or via PgBouncer). Skipped otherwise.
+// Apples-to-apples comparison: pg2json vs pgx on the same wire, same PG,
+// same shapes. All benches write NDJSON to io.Discard. Requires
+// PG2JSON_TEST_DSN.
 //
-// Three apples-to-apples paths, all writing to io.Discard:
+// Three paths:
 //
-//	pg2json_NDJSON            — native path, direct wire → JSON bytes.
-//	pgx_Map_Marshal           — pgx rows.Values() → []any →
-//	                            json.Marshal. Common naive path.
-//	pgx_Raw_ManualJSON        — pgx rows.RawValues() + bytes to JSON
-//	                            via a minimal hand-rolled writer. Best
-//	                            case for pgx — no intermediate Go types.
+//	Pg2JSON        — native StreamNDJSON.
+//	PgxMap         — pgx rows.Values() → map[string]any → json.Marshal.
+//	                 The naive-but-common path.
+//	PgxRaw         — pgx rows.RawValues() + hand-written NDJSON encoder.
+//	                 Best case for pgx; no intermediate Go types.
 //
-// benchSQL is the same 5-column mixed query the existing BenchmarkCompare
-// uses, for continuity with the historical numbers.
+// Five shapes, three sizes each:
+//
+//	narrow_int   : single int4 column.
+//	mixed_5col   : id int4, name text, score float8, flag bool, meta jsonb.
+//	wide_jsonb   : id int4, j jsonb (canonical 3-field object).
+//	array_int    : id int4, arr int4[] of 10 elements (tests array decoder).
+//	null_heavy   : id int4, v text where v is NULL for 50% of rows.
 package tests
 
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -27,12 +34,120 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-func openPGX(b *testing.B) *pgx.Conn {
-	b.Helper()
+type shape struct {
+	name string
+	sql  func(n int) string
+	fmts []int16 // per-column binary formats for pgx Raw path
+}
+
+var benchShapes = []shape{
+	{
+		"narrow_int",
+		func(n int) string {
+			return fmt.Sprintf("SELECT g::int4 AS id FROM generate_series(1, %d) g", n)
+		},
+		[]int16{1},
+	},
+	{
+		"mixed_5col",
+		func(n int) string {
+			return fmt.Sprintf(`SELECT g::int4 AS id, 'name-'||g AS name,
+				(g::float8 / 3.0) AS score, (g %% 2 = 0) AS flag,
+				('{"k":'||g||'}')::jsonb AS meta
+				FROM generate_series(1, %d) g`, n)
+		},
+		[]int16{1, 1, 1, 1, 1},
+	},
+	{
+		"wide_jsonb",
+		func(n int) string {
+			return fmt.Sprintf(`SELECT g::int4 AS id,
+				('{"a":1,"b":[1,2,3],"c":"x"}')::jsonb AS j
+				FROM generate_series(1, %d) g`, n)
+		},
+		[]int16{1, 1},
+	},
+	{
+		"array_int",
+		func(n int) string {
+			return fmt.Sprintf(`SELECT g::int4 AS id,
+				ARRAY[g,g+1,g+2,g+3,g+4,g+5,g+6,g+7,g+8,g+9]::int4[] AS arr
+				FROM generate_series(1, %d) g`, n)
+		},
+		[]int16{1, 1},
+	},
+	{
+		"null_heavy",
+		func(n int) string {
+			return fmt.Sprintf(`SELECT g::int4 AS id,
+				CASE WHEN g %% 2 = 0 THEN NULL ELSE 'row-'||g END AS v
+				FROM generate_series(1, %d) g`, n)
+		},
+		[]int16{1, 1},
+	},
+}
+
+var benchSizes = []int{1000, 10000, 100000}
+
+func BenchmarkPgx(b *testing.B) {
 	dsn := os.Getenv("PG2JSON_TEST_DSN")
 	if dsn == "" {
 		b.Skip("PG2JSON_TEST_DSN not set")
 	}
+	for _, sh := range benchShapes {
+		for _, n := range benchSizes {
+			sql := sh.sql(n)
+			b.Run(fmt.Sprintf("%s/%d/Pg2JSON", sh.name, n), func(b *testing.B) {
+				c := openClient(b)
+				defer c.Close()
+				b.ReportAllocs()
+				b.ResetTimer()
+				var bytesSum int64
+				for i := 0; i < b.N; i++ {
+					cw := &countingWriterBytes{}
+					if err := c.StreamNDJSON(context.Background(), cw, sql); err != nil {
+						b.Fatal(err)
+					}
+					bytesSum += cw.n
+				}
+				b.SetBytes(bytesSum / int64(b.N))
+			})
+			b.Run(fmt.Sprintf("%s/%d/PgxMap", sh.name, n), func(b *testing.B) {
+				c := pgxConnect(b, dsn)
+				defer c.Close(context.Background())
+				b.ReportAllocs()
+				b.ResetTimer()
+				var bytesSum int64
+				for i := 0; i < b.N; i++ {
+					n, err := runPgxMap(c, sql, io.Discard)
+					if err != nil {
+						b.Fatal(err)
+					}
+					bytesSum += n
+				}
+				b.SetBytes(bytesSum / int64(b.N))
+			})
+			b.Run(fmt.Sprintf("%s/%d/PgxRaw", sh.name, n), func(b *testing.B) {
+				c := pgxConnect(b, dsn)
+				defer c.Close(context.Background())
+				b.ReportAllocs()
+				b.ResetTimer()
+				var bytesSum int64
+				for i := 0; i < b.N; i++ {
+					n, err := runPgxRaw(c, sql, sh.fmts, io.Discard)
+					if err != nil {
+						b.Fatal(err)
+					}
+					bytesSum += n
+				}
+				b.SetBytes(bytesSum / int64(b.N))
+			})
+		}
+	}
+}
+
+func pgxConnect(b *testing.B, dsn string) *pgx.Conn {
+	b.Helper()
 	c, err := pgx.Connect(context.Background(), dsn)
 	if err != nil {
 		b.Fatal(err)
@@ -40,217 +155,198 @@ func openPGX(b *testing.B) *pgx.Conn {
 	return c
 }
 
-// BenchmarkPGXCompare_Pg2JSON: the native path; mirrors the existing
-// BenchmarkCompare_PG2JSON_NDJSON but re-declared here so all three
-// variants run in the same package and under the same -bench filter.
-func BenchmarkPGXCompare_Pg2JSON(b *testing.B) {
-	c := openClient(b)
-	defer c.Close()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if err := c.StreamNDJSON(context.Background(), io.Discard, benchSQL); err != nil {
-			b.Fatal(err)
-		}
-	}
+type countingWriterBytes struct{ n int64 }
+
+func (c *countingWriterBytes) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+	return len(p), nil
 }
 
-// BenchmarkPGXCompare_PgxMapMarshal is the common naive pgx path: read
-// each row into rows.Values() (which pgx converts to Go types for you),
-// stuff into a map, json.Marshal, write.
-func BenchmarkPGXCompare_PgxMapMarshal(b *testing.B) {
-	c := openPGX(b)
-	defer c.Close(context.Background())
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		rows, err := c.Query(context.Background(), benchSQL)
+// runPgxMap: pgx Values() → map[string]any → json.Marshal per row.
+// Classic "I use pgx and encoding/json" pattern.
+func runPgxMap(c *pgx.Conn, sql string, w io.Writer) (int64, error) {
+	rows, err := c.Query(context.Background(), sql)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	fds := rows.FieldDescriptions()
+	names := make([]string, len(fds))
+	for i, f := range fds {
+		names[i] = f.Name
+	}
+	var total int64
+	for rows.Next() {
+		vals, err := rows.Values()
 		if err != nil {
-			b.Fatal(err)
+			return total, err
 		}
-		fds := rows.FieldDescriptions()
-		names := make([]string, len(fds))
-		for j, f := range fds {
-			names[j] = f.Name
+		m := make(map[string]any, len(names))
+		for i, v := range vals {
+			m[names[i]] = v
 		}
-		enc := newBenchEncoder()
-		enc.writeByte('[')
-		first := true
-		for rows.Next() {
-			vals, err := rows.Values()
-			if err != nil {
-				rows.Close()
-				b.Fatal(err)
-			}
-			m := make(map[string]any, len(names))
-			for j, v := range vals {
-				m[names[j]] = v
-			}
-			if !first {
-				enc.writeByte(',')
-			}
-			first = false
-			if err := enc.marshalMap(m); err != nil {
-				rows.Close()
-				b.Fatal(err)
-			}
-		}
-		enc.writeByte(']')
-		if err := rows.Err(); err != nil {
-			b.Fatal(err)
-		}
-		rows.Close()
-		_, _ = io.Discard.Write(enc.bytes())
-	}
-}
-
-// BenchmarkPGXCompare_PgxRawManual: best-case for pgx. Use RawValues()
-// (no type conversion) and hand-render each cell to NDJSON directly.
-// This is the path someone who really cared about performance would
-// write by hand on top of pgx. It intentionally does NOT use
-// json.Marshal for the numeric / string paths.
-func BenchmarkPGXCompare_PgxRawManual(b *testing.B) {
-	c := openPGX(b)
-	defer c.Close(context.Background())
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		rows, err := c.Query(context.Background(), benchSQL, pgx.QueryResultFormats{1, 1, 1, 1, 1})
+		b, err := json.Marshal(m)
 		if err != nil {
-			b.Fatal(err)
+			return total, err
 		}
-		fds := rows.FieldDescriptions()
-		keys := make([][]byte, len(fds))
-		for j, f := range fds {
-			keys[j] = []byte(`"` + f.Name + `":`)
+		n, err := w.Write(b)
+		total += int64(n)
+		if err != nil {
+			return total, err
 		}
-		enc := newBenchEncoder()
-		for rows.Next() {
-			raw := rows.RawValues()
-			enc.writeByte('{')
-			for j, cell := range raw {
-				if j > 0 {
-					enc.writeByte(',')
-				}
-				enc.writeBytes(keys[j])
-				renderPgxCellBinary(enc, fds[j].DataTypeOID, cell)
-			}
-			enc.writeByte('}')
-			enc.writeByte('\n')
+		n, err = w.Write([]byte("\n"))
+		total += int64(n)
+		if err != nil {
+			return total, err
 		}
-		if err := rows.Err(); err != nil {
-			b.Fatal(err)
-		}
-		rows.Close()
-		_, _ = io.Discard.Write(enc.bytes())
 	}
+	return total, rows.Err()
 }
 
-// renderPgxCellBinary is the hand-rolled per-cell emitter. Covers the
-// 5 OIDs the benchmark query produces.
-func renderPgxCellBinary(e *benchEncoder, oid uint32, raw []byte) {
+// runPgxRaw: pgx RawValues() + hand-written NDJSON encoder. Requests
+// binary format for every column.
+func runPgxRaw(c *pgx.Conn, sql string, fmts []int16, w io.Writer) (int64, error) {
+	rows, err := c.Query(context.Background(), sql, pgx.QueryResultFormats(fmts))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	fds := rows.FieldDescriptions()
+	keys := make([][]byte, len(fds))
+	oids := make([]uint32, len(fds))
+	for i, f := range fds {
+		keys[i] = []byte(`"` + f.Name + `":`)
+		oids[i] = f.DataTypeOID
+	}
+	buf := make([]byte, 0, 64*1024)
+	var total int64
+	flush := func() error {
+		if len(buf) == 0 {
+			return nil
+		}
+		n, err := w.Write(buf)
+		total += int64(n)
+		buf = buf[:0]
+		return err
+	}
+	for rows.Next() {
+		raw := rows.RawValues()
+		buf = append(buf, '{')
+		for i, cell := range raw {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = append(buf, keys[i]...)
+			buf = appendRawCell(buf, oids[i], cell)
+		}
+		buf = append(buf, '}', '\n')
+		if len(buf) >= 32*1024 {
+			if err := flush(); err != nil {
+				return total, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return total, err
+	}
+	return total, rows.Err()
+}
+
+func appendRawCell(dst []byte, oid uint32, raw []byte) []byte {
 	if raw == nil {
-		e.writeBytes([]byte("null"))
-		return
+		return append(dst, 'n', 'u', 'l', 'l')
 	}
 	switch oid {
-	case pgtype.Int4OID, pgtype.Int8OID:
-		var v int64
-		if len(raw) == 4 {
-			v = int64(int32(uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])))
-		} else if len(raw) == 8 {
-			v = int64(uint64(raw[0])<<56 | uint64(raw[1])<<48 | uint64(raw[2])<<40 | uint64(raw[3])<<32 |
-				uint64(raw[4])<<24 | uint64(raw[5])<<16 | uint64(raw[6])<<8 | uint64(raw[7]))
-		}
-		e.buf = strconv.AppendInt(e.buf, v, 10)
+	case pgtype.Int2OID:
+		v := int16(uint16(raw[0])<<8 | uint16(raw[1]))
+		return strconv.AppendInt(dst, int64(v), 10)
+	case pgtype.Int4OID, pgtype.OIDOID:
+		v := int32(uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3]))
+		return strconv.AppendInt(dst, int64(v), 10)
+	case pgtype.Int8OID:
+		v := int64(uint64(raw[0])<<56 | uint64(raw[1])<<48 | uint64(raw[2])<<40 | uint64(raw[3])<<32 |
+			uint64(raw[4])<<24 | uint64(raw[5])<<16 | uint64(raw[6])<<8 | uint64(raw[7]))
+		return strconv.AppendInt(dst, v, 10)
 	case pgtype.Float8OID:
-		var u uint64
-		for i := 0; i < 8; i++ {
-			u = u<<8 | uint64(raw[i])
-		}
-		e.buf = strconv.AppendFloat(e.buf, math.Float64frombits(u), 'g', -1, 64)
+		u := uint64(raw[0])<<56 | uint64(raw[1])<<48 | uint64(raw[2])<<40 | uint64(raw[3])<<32 |
+			uint64(raw[4])<<24 | uint64(raw[5])<<16 | uint64(raw[6])<<8 | uint64(raw[7])
+		return strconv.AppendFloat(dst, math.Float64frombits(u), 'g', -1, 64)
 	case pgtype.BoolOID:
 		if len(raw) == 1 && raw[0] != 0 {
-			e.writeBytes([]byte("true"))
-		} else {
-			e.writeBytes([]byte("false"))
+			return append(dst, 't', 'r', 'u', 'e')
 		}
+		return append(dst, 'f', 'a', 'l', 's', 'e')
 	case pgtype.TextOID, pgtype.VarcharOID, pgtype.NameOID, pgtype.BPCharOID:
-		e.writeByte('"')
-		e.writeBytes(raw)
-		e.writeByte('"')
+		dst = append(dst, '"')
+		dst = appendEscaped(dst, raw)
+		return append(dst, '"')
 	case pgtype.JSONBOID:
 		if len(raw) > 0 && raw[0] == 1 {
-			e.writeBytes(raw[1:])
-		} else {
-			e.writeBytes(raw)
+			return append(dst, raw[1:]...)
 		}
+		return append(dst, raw...)
 	case pgtype.JSONOID:
-		e.writeBytes(raw)
+		return append(dst, raw...)
+	case pgtype.Int4ArrayOID:
+		return appendInt4ArrayBinary(dst, raw)
+	case pgtype.ByteaOID:
+		dst = append(dst, '"', '\\', '\\', 'x')
+		dst = append(dst, []byte(hex.EncodeToString(raw))...)
+		return append(dst, '"')
 	default:
-		e.writeByte('"')
-		e.writeBytes([]byte(hex.EncodeToString(raw)))
-		e.writeByte('"')
+		dst = append(dst, '"')
+		dst = append(dst, raw...)
+		return append(dst, '"')
 	}
 }
 
-// benchEncoder is a bare-bones buffer used in both pgx paths so we
-// measure the pgx-vs-pg2json delta, not the Go json library.
-type benchEncoder struct{ buf []byte }
-
-func newBenchEncoder() *benchEncoder { return &benchEncoder{buf: make([]byte, 0, 4096)} }
-func (e *benchEncoder) bytes() []byte { return e.buf }
-func (e *benchEncoder) writeByte(c byte) { e.buf = append(e.buf, c) }
-func (e *benchEncoder) writeBytes(b []byte) { e.buf = append(e.buf, b...) }
-
-// marshalMap is a trivial JSON encoder for map[string]any; we call it
-// directly rather than go through encoding/json so the "map-marshal"
-// path gets the same buffer infrastructure as the raw path. It covers
-// the types the benchmark produces.
-func (e *benchEncoder) marshalMap(m map[string]any) error {
-	e.writeByte('{')
-	first := true
-	for k, v := range m {
-		if !first {
-			e.writeByte(',')
+func appendEscaped(dst, src []byte) []byte {
+	// Minimal escaper matching JSON requirements — same approach as
+	// pg2json's jsonwriter but tiny, for the pgx bench only.
+	for _, c := range src {
+		switch {
+		case c == '"':
+			dst = append(dst, '\\', '"')
+		case c == '\\':
+			dst = append(dst, '\\', '\\')
+		case c < 0x20:
+			dst = append(dst, '\\', 'u', '0', '0', hexLower[c>>4], hexLower[c&0xF])
+		default:
+			dst = append(dst, c)
 		}
-		first = false
-		e.writeByte('"')
-		e.writeBytes([]byte(k))
-		e.writeBytes([]byte(`":`))
-		e.marshalValue(v)
 	}
-	e.writeByte('}')
-	return nil
+	return dst
 }
 
-func (e *benchEncoder) marshalValue(v any) {
-	switch x := v.(type) {
-	case nil:
-		e.writeBytes([]byte("null"))
-	case int32:
-		e.buf = strconv.AppendInt(e.buf, int64(x), 10)
-	case int64:
-		e.buf = strconv.AppendInt(e.buf, x, 10)
-	case float64:
-		e.buf = strconv.AppendFloat(e.buf, x, 'g', -1, 64)
-	case bool:
-		if x {
-			e.writeBytes([]byte("true"))
-		} else {
-			e.writeBytes([]byte("false"))
-		}
-	case string:
-		e.writeByte('"')
-		e.writeBytes([]byte(x))
-		e.writeByte('"')
-	case []byte:
-		e.writeByte('"')
-		e.writeBytes([]byte(hex.EncodeToString(x)))
-		e.writeByte('"')
-	default:
-		// jsonb / unknown: fall through to Go's json by interface value.
-		// This mirrors what a naive app actually does.
-		e.writeBytes([]byte(`"<opaque>"`))
+const hexLower = "0123456789abcdef"
+
+func appendInt4ArrayBinary(dst, raw []byte) []byte {
+	if len(raw) < 12 {
+		return append(dst, '[', ']')
 	}
+	ndim := int32(uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3]))
+	if ndim != 1 {
+		return append(dst, '[', ']')
+	}
+	size := int32(uint32(raw[12])<<24 | uint32(raw[13])<<16 | uint32(raw[14])<<8 | uint32(raw[15]))
+	body := raw[20:]
+	dst = append(dst, '[')
+	off := 0
+	for i := int32(0); i < size; i++ {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		elemLen := int32(uint32(body[off])<<24 | uint32(body[off+1])<<16 |
+			uint32(body[off+2])<<8 | uint32(body[off+3]))
+		off += 4
+		if elemLen < 0 {
+			dst = append(dst, 'n', 'u', 'l', 'l')
+			continue
+		}
+		v := int32(uint32(body[off])<<24 | uint32(body[off+1])<<16 |
+			uint32(body[off+2])<<8 | uint32(body[off+3]))
+		off += int(elemLen)
+		dst = strconv.AppendInt(dst, int64(v), 10)
+	}
+	return append(dst, ']')
 }
