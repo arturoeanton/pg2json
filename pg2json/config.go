@@ -82,6 +82,20 @@ type Config struct {
 	// false. Citus shard rebalance surfaces 40001 routinely; enable in
 	// environments that run rebalance in production.
 	RetryOnSerialization bool
+
+	// DefaultQueryTimeout is a convenience default applied when a caller
+	// passes a context with no deadline. The driver derives
+	// context.WithTimeout(ctx, DefaultQueryTimeout) and the existing
+	// cancel watcher turns an elapsed timeout into a real server-side
+	// CancelRequest. 0 = no default (the caller's ctx is used as-is).
+	//
+	// This is a *sane default*, not a hard security boundary. The hard
+	// ceiling belongs in postgresql.conf (statement_timeout). Layers:
+	//
+	//   1. postgresql.conf statement_timeout  — DBA-owned, final say.
+	//   2. Config.DefaultQueryTimeout          — gateway default.
+	//   3. ctx.WithTimeout in the HTTP handler — per-request override.
+	DefaultQueryTimeout time.Duration
 }
 
 func (c *Config) applyDefaults() {

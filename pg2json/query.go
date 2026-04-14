@@ -115,6 +115,15 @@ func (c *Client) runQuery(ctx context.Context, out outWriter, mode Mode, sql str
 	if err = rejectNonSelect(sql); err != nil {
 		return err
 	}
+	// Apply DefaultQueryTimeout only if the caller's ctx has no deadline
+	// (so per-request ctx.WithTimeout always wins).
+	if d := c.cfg.DefaultQueryTimeout; d > 0 {
+		if _, hasDL := ctx.Deadline(); !hasDL {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+	}
 	c.observer.OnQueryStart(sql)
 	start := time.Now()
 	defer func() {

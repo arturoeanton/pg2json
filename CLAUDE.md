@@ -149,37 +149,49 @@ PG2JSON_TEST_DSN='...' go test ./tests/ -bench=BenchmarkCompare -benchmem -bench
 8. **Don't add deps without a strong reason**. Today: stdlib only. SCRAM
    uses hand-rolled PBKDF2 to avoid `golang.org/x/crypto`. The bar is high.
 
-## Known gaps (P1, intentionally not done yet)
+## P1 hardening — status
 
-These are fair game for the next session. None are correctness bugs; they
-are operational hardening for sustained 8h / 500k-user workloads.
+Done this session:
 
-- **Hard byte/row caps per response** + backpressure when exceeded.
-- **Flush by time** (not just by byte threshold) — variable-latency Citus
-  queries need this for UX.
-- **Slow query log hook** (`OnQuerySlow` callback above N ms threshold).
-- **NoticeResponse hook** — currently dropped silently; Citus surfaces
-  worker warnings here.
-- **Retry on SQLSTATE class 40** (transaction rollback / serialisation
-  failure) — Citus shard rebalance produces these and they're retryable.
-- **TCP keepalive** explicitly enabled on dial. Default OS values bite
-  through PgBouncer / NAT after long idle.
-- **Connect timeout honours full ctx** for handshake, not just dial.
+- Hard byte/row caps (`Config.MaxResponseBytes` / `MaxResponseRows` →
+  `*ResponseTooLargeError` with Committed flag; CancelRequest + drain).
+- Flush by time (`Config.FlushInterval`).
+- `Observer.OnQuerySlow` (`Config.SlowQueryThreshold`).
+- `Observer.OnNotice` (NoticeResponse no longer dropped).
+- Retry on SQLSTATE 40001 / 40P01 (`Config.RetryOnSerialization`).
+- TCP keepalive on dial (`Config.Keepalive`, default 30s).
+- Handshake honours ctx deadline (SetDeadline during startup/TLS/auth).
+- `Pool.Drain(ctx)` and `Pool.WaitIdle(ctx)`.
+- Binary decoders for arrays (recursive, multi-dim), interval, time, timetz.
+- `Config.DefaultQueryTimeout` (ctx-based per-query default).
+
+Still pending:
+
 - **Buffer pool global cap** — today the pool grows unbounded during a
   burst.
-- **Graceful shutdown** with pool draining + signal handling helper.
 - **Fuzz tests** for the JSON writer and the protocol parser.
-
-A full P1 attack prompt is in the chat history (look for "P1 prompt") or
-ask the user.
 
 ## Known gaps (P2, deliberate)
 
 - COPY binary fast-export path.
 - Numeric binary decoder (text form is fine for now).
-- Array binary decoder (recursive).
-- Time / timetz / interval binary decoders.
 - Connect-time protocol negotiation (3.1+/grease).
+
+## Timeouts: defence in depth
+
+The driver ships three knobs; none is a security boundary on its own.
+
+  1. `postgresql.conf` `statement_timeout` — DBA-owned, final hard ceiling.
+     Protects against misbehaving clients and our own bugs.
+  2. `Config.DefaultQueryTimeout` — gateway-level sane default applied
+     only when the caller's ctx has no deadline. Fires a real server-side
+     CancelRequest via the existing ctx watcher.
+  3. `ctx.WithTimeout` at the HTTP handler — per-request override that
+     always wins if shorter than (2).
+
+Do NOT rely on the client-side timeouts as a security boundary. If a
+bug in pg2json or a misbehaving caller leaks a ctx without deadline,
+only (1) stops a runaway query from burning a backend for hours.
 
 ## Things this project will NOT do
 
