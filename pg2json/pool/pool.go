@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arturoeanton/pg2json/internal/bufferpool"
 	"github.com/arturoeanton/pg2json/pg2json"
 )
 
@@ -38,6 +39,15 @@ type Config struct {
 	// Bound the long-tail growth of server-side state (prepared stmts,
 	// catalog caches, etc.) on long-lived backends.
 	MaxConnLifetime time.Duration
+
+	// MaxInFlightBuffers caps the number of scratch buffers checked out
+	// from the internal buffer pool at any instant. Applied process-wide
+	// (the buffer pool is a package-level singleton). 0 = unbounded.
+	// Useful under extreme bursts where 32 KiB × N-thousand concurrent
+	// queries would otherwise balloon the pool's backing slab. When the
+	// cap is hit, Get falls back to plain make() and bypasses the pool;
+	// callers always receive a usable buffer.
+	MaxInFlightBuffers int
 }
 
 func (c *Config) applyDefaults() {
@@ -55,6 +65,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxConnLifetime == 0 {
 		c.MaxConnLifetime = time.Hour
+	}
+	if c.MaxInFlightBuffers > 0 {
+		bufferpool.SetMaxLive(c.MaxInFlightBuffers)
 	}
 }
 
