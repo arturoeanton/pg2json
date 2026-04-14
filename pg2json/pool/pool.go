@@ -62,11 +62,14 @@ func (c *Config) applyDefaults() {
 type Pool struct {
 	cfg Config
 
-	mu        sync.Mutex
-	idle      []*entry
-	open      int
-	closed    bool
-	waiters   []chan *entry
+	mu       sync.Mutex
+	idle     []*entry
+	open     int
+	inUse    int
+	closed   bool
+	draining bool
+	waiters  []chan *entry
+	idleCond *sync.Cond // signalled when inUse reaches 0
 
 	stopReaper chan struct{}
 }
@@ -84,6 +87,7 @@ func New(cfg Config) (*Pool, error) {
 		cfg:        cfg,
 		stopReaper: make(chan struct{}),
 	}
+	p.idleCond = sync.NewCond(&p.mu)
 	for i := 0; i < cfg.MinIdle; i++ {
 		c, err := pg2json.Open(context.Background(), cfg.Config)
 		if err != nil {
@@ -127,6 +131,12 @@ func (c *Conn) Discard() {
 	}
 	c.done = true
 	_ = c.Client.Close()
+	c.pool.mu.Lock()
+	c.pool.inUse--
+	if c.pool.inUse == 0 {
+		c.pool.idleCond.Broadcast()
+	}
+	c.pool.mu.Unlock()
 	c.pool.discard()
 }
 
@@ -168,21 +178,26 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 
 func (p *Pool) acquireOnce(ctx context.Context) (*Conn, error) {
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || p.draining {
 		p.mu.Unlock()
 		return nil, ErrClosed
 	}
 	if n := len(p.idle); n > 0 {
 		e := p.idle[n-1]
 		p.idle = p.idle[:n-1]
+		p.inUse++
 		p.mu.Unlock()
 		return &Conn{Client: e.c, pool: p, e: e}, nil
 	}
 	if p.open < p.cfg.MaxConns {
 		p.open++
+		p.inUse++
 		p.mu.Unlock()
 		c, err := pg2json.Open(ctx, p.cfg.Config)
 		if err != nil {
+			p.mu.Lock()
+			p.inUse--
+			p.mu.Unlock()
 			p.discard()
 			return nil, err
 		}
@@ -198,6 +213,9 @@ func (p *Pool) acquireOnce(ctx context.Context) (*Conn, error) {
 		if e == nil {
 			return nil, ErrClosed
 		}
+		p.mu.Lock()
+		p.inUse++
+		p.mu.Unlock()
 		return &Conn{Client: e.c, pool: p, e: e}, nil
 	case <-ctx.Done():
 		p.mu.Lock()
@@ -215,9 +233,16 @@ func (p *Pool) acquireOnce(ctx context.Context) (*Conn, error) {
 func (p *Pool) put(e *entry) {
 	e.lastUsed = time.Now()
 	p.mu.Lock()
-	if p.closed {
+	p.inUse--
+	if p.inUse == 0 {
+		p.idleCond.Broadcast()
+	}
+	if p.closed || p.draining {
 		p.mu.Unlock()
 		_ = e.c.Close()
+		p.mu.Lock()
+		p.open--
+		p.mu.Unlock()
 		return
 	}
 	if len(p.waiters) > 0 {
@@ -268,6 +293,88 @@ func (p *Pool) discard() {
 	p.mu.Unlock()
 }
 
+// Drain stops accepting new Acquire calls and waits for in-flight
+// connections to be Released. Idle connections are closed immediately.
+// Returns ctx.Err() if ctx expires before all in-flight conns return.
+// After a successful Drain, Close is a no-op other than cleanup.
+//
+// Typical rolling-deploy pattern:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	if err := pool.Drain(ctx); err != nil { /* log; forced shutdown */ }
+//	pool.Close()
+func (p *Pool) Drain(ctx context.Context) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.draining = true
+	idle := p.idle
+	p.idle = nil
+	waiters := p.waiters
+	p.waiters = nil
+	p.mu.Unlock()
+
+	// Close all idle conns immediately; they carry no in-flight work.
+	for _, e := range idle {
+		_ = e.c.Close()
+	}
+	p.mu.Lock()
+	p.open -= len(idle)
+	p.mu.Unlock()
+	// Unblock any pending Acquire waiters with ErrClosed.
+	for _, w := range waiters {
+		w <- nil
+	}
+
+	// Wait for inUse to reach 0 or ctx to expire.
+	done := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		for p.inUse > 0 {
+			p.idleCond.Wait()
+		}
+		p.mu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Wake up the waiter goroutine so it exits.
+		p.mu.Lock()
+		p.idleCond.Broadcast()
+		p.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+// WaitIdle blocks until the pool has no in-flight (acquired) connections.
+// Handy in tests and between rolling-deploy phases. Returns immediately if
+// the pool is already idle.
+func (p *Pool) WaitIdle(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		for p.inUse > 0 && !p.closed {
+			p.idleCond.Wait()
+		}
+		p.mu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		p.mu.Lock()
+		p.idleCond.Broadcast()
+		p.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
 // Close drains the pool and closes every idle connection. Outstanding
 // Acquire callers receive ErrClosed.
 func (p *Pool) Close() error {
@@ -281,6 +388,7 @@ func (p *Pool) Close() error {
 	p.idle = nil
 	waiters := p.waiters
 	p.waiters = nil
+	p.idleCond.Broadcast()
 	p.mu.Unlock()
 
 	close(p.stopReaper)
@@ -297,6 +405,7 @@ func (p *Pool) Close() error {
 type Stats struct {
 	Open    int
 	Idle    int
+	InUse   int
 	Waiting int
 	Max     int
 }
@@ -304,7 +413,13 @@ type Stats struct {
 func (p *Pool) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return Stats{Open: p.open, Idle: len(p.idle), Waiting: len(p.waiters), Max: p.cfg.MaxConns}
+	return Stats{
+		Open:    p.open,
+		Idle:    len(p.idle),
+		InUse:   p.inUse,
+		Waiting: len(p.waiters),
+		Max:     p.cfg.MaxConns,
+	}
 }
 
 func (p *Pool) reaper() {
