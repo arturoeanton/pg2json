@@ -38,6 +38,12 @@ func PickBinary(oid protocol.OID) Encoder {
 		return encodeJSONBBinary
 	case protocol.OIDJSON:
 		return EncodeJSONPassthrough // identical bytes in binary
+	case protocol.OIDInterval:
+		return encodeIntervalBinary
+	case protocol.OIDTime:
+		return encodeTimeBinary
+	case protocol.OIDTimeTZ:
+		return encodeTimeTZBinary
 	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDBPChar,
 		protocol.OIDName, protocol.OIDBytea:
 		// For variable-length text-shaped types the binary format gives
@@ -47,6 +53,9 @@ func PickBinary(oid protocol.OID) Encoder {
 			return encodeByteaBinary
 		}
 		return EncodeString
+	}
+	if elem := protocol.ArrayElem(oid); elem != 0 {
+		return makeArrayBinaryEncoder(elem)
 	}
 	return nil
 }
