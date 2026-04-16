@@ -166,10 +166,26 @@ Also supported in struct scan:
   (empty, inclusive, infinite on each side). Decode bounds further
   with `pg2json.DriverValueDecoder` on the element OID.
 
-Not supported in struct scan (use your other driver or an
-`sql.Scanner` custom type): composite types (`ROW(a,b,c)`), 3-D+
-arrays, `pgtype.*` wrappers. The JSON output paths handle all of
-these safely via text fallback.
+Also supported, with a small caveat — **composite types**
+(`ROW(a,b,c)` or `CREATE TYPE addr AS (...)`). The OID of a
+user-defined composite is assigned by PG at `CREATE TYPE` time, so
+pg2json cannot know about it statically. Declare it in
+`Config.BinaryOIDs` and struct scan picks up the composite wire
+format automatically:
+
+```go
+cfg.BinaryOIDs = []uint32{composeOID} // SELECT oid FROM pg_type ...
+c, _ := pg2json.Open(ctx, cfg)
+
+type Addr struct { Street, City string; Zip int32 }
+type Row  struct { Addr Addr `pg2json:"addr"` }
+rows, _ := pg2json.ScanStruct[Row](c, ctx,
+    "SELECT ROW('1 Main','Springfield',12345)::pg2json_addr AS addr")
+```
+
+Not supported in struct scan (use pgx or an `sql.Scanner` custom
+type): 3-D+ arrays, `pgtype.*` wrappers. JSON output paths handle
+all these safely via a text / opaque-binary fallback.
 
 ---
 
@@ -276,7 +292,8 @@ Key features for production:
 | Bulk read that would OOM with a plain slice | `ScanStructBatched[T]` |
 | Read rows and forward them to an HTTP / queue / cache | either path |
 | Writes, transactions, LISTEN/NOTIFY, COPY | keep your existing driver |
-| Composite (`ROW(…)`) or 3-D+ arrays | keep your existing driver |
+| 3-D+ arrays, `pgtype.*` wrappers | keep your existing driver |
+| Composite types (`ROW(…)`) | **pg2json** — declare the OID in `Config.BinaryOIDs` |
 
 ---
 
@@ -410,9 +427,10 @@ db, _ := sql.Open("pg2json", dsn)
   Keep a write driver for those.
 - **Struct scan scope.** Covers scalars, pointer-for-NULL,
   `sql.Null*`, any `sql.Scanner`, 1-D and 2-D arrays, embedded
-  structs, and range types (via `pg2json.RangeBytes`). Composite
-  types (`ROW(a,b)`), 3-D+ arrays, and `pgtype.*` wrappers are not
-  in scope — use pgx's scan path for those shapes.
+  structs, range types (via `pg2json.RangeBytes`), and user-
+  defined composite types (declare the OID in
+  `Config.BinaryOIDs`). 3-D+ arrays and `pgtype.*` wrappers are
+  not in scope — use pgx for those shapes.
 - **Numeric uses text format.** Binary numeric decoder ships as an
   opt-in utility (`types.EncodeNumericBinary`) but is not
   auto-selected; on loopback the text path is faster.

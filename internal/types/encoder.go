@@ -54,6 +54,25 @@ func EncodeString(dst, raw []byte) []byte {
 	return jsonwriter.AppendStringBytes(dst, raw)
 }
 
+// EncodeOpaqueBinary emits the raw binary bytes as a hex-encoded
+// JSON string with a "\\x" prefix, matching PG's own bytea text
+// form. Used as a safe JSON-output fallback when the caller
+// requested binary format for an OID that has no specialised
+// decoder (typical for user-declared composite types in
+// Config.BinaryOIDs). Human-readable enough to debug, always
+// valid JSON.
+func EncodeOpaqueBinary(dst, raw []byte) []byte {
+	if raw == nil {
+		return jsonwriter.AppendNull(dst)
+	}
+	const hex = "0123456789abcdef"
+	dst = append(dst, '"', '\\', '\\', 'x')
+	for _, b := range raw {
+		dst = append(dst, hex[b>>4], hex[b&0xF])
+	}
+	return append(dst, '"')
+}
+
 // EncodeQuotedASCII is a fast path for values we know are pure ASCII with
 // no characters that need escaping (timestamps, dates, intervals as the
 // server formats them). We still validate cheaply.

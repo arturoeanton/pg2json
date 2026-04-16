@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/arturoeanton/pg2json/pg2json"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestScanStructLive(t *testing.T) {
@@ -369,6 +370,70 @@ func TestScanStructArray2D(t *testing.T) {
 				t.Fatalf("g[%d][%d] = %d, want %d", i, j, g[i][j], want[i][j])
 			}
 		}
+	}
+}
+
+func TestScanStructComposite(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+
+	// Set up a user-defined composite type. We do it through pgx
+	// because pg2json is read-only. This is a one-shot — DROP +
+	// CREATE is fine even if the type survives across test runs.
+	pcfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupConn, err := pgx.ConnectConfig(context.Background(), pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer setupConn.Close(context.Background())
+	_, _ = setupConn.Exec(context.Background(), "DROP TYPE IF EXISTS pg2json_addr")
+	if _, err := setupConn.Exec(context.Background(),
+		"CREATE TYPE pg2json_addr AS (street text, city text, zip int4)"); err != nil {
+		t.Fatal(err)
+	}
+	defer setupConn.Exec(context.Background(), "DROP TYPE IF EXISTS pg2json_addr")
+
+	// Look up the assigned OID — this is the number the caller
+	// would stash in Config.BinaryOIDs in a real application.
+	var oid uint32
+	if err := setupConn.QueryRow(context.Background(),
+		"SELECT oid FROM pg_type WHERE typname = 'pg2json_addr'").Scan(&oid); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a fresh pg2json client with the composite OID declared.
+	cfg, _ := pg2json.ParseDSN(dsn)
+	cfg.BinaryOIDs = []uint32{oid}
+	c, err := pg2json.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	type Addr struct {
+		Street string
+		City   string
+		Zip    int32
+	}
+	type row struct {
+		Addr Addr `pg2json:"addr"`
+	}
+	out, err := pg2json.ScanStruct[row](c, context.Background(),
+		"SELECT ROW('1 Main St','Springfield',12345)::pg2json_addr AS addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("got %d rows", len(out))
+	}
+	got := out[0].Addr
+	if got.Street != "1 Main St" || got.City != "Springfield" || got.Zip != 12345 {
+		t.Fatalf("addr: %+v", got)
 	}
 }
 

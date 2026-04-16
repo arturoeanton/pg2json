@@ -51,6 +51,13 @@ func (p *Plan) ApplyFormats(formats []int16) {
 		if f == 1 {
 			if be := types.PickBinary(p.Columns[i].TypeOID); be != nil {
 				p.Columns[i].Encoder = be
+			} else {
+				// Binary requested but we have no specialised
+				// decoder — typical for user-declared composites
+				// in Config.BinaryOIDs. Use the opaque fallback
+				// for JSON output; struct scan recognises the
+				// shape from the target Go type.
+				p.Columns[i].Encoder = types.EncodeOpaqueBinary
 			}
 		} else {
 			p.Columns[i].Encoder = types.Pick(p.Columns[i].TypeOID)

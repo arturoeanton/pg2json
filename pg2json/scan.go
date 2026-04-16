@@ -757,6 +757,9 @@ func pickSetter(oid protocol.OID, format int16, targetType reflect.Type) (func(u
 	if setter, ok := pickRangeSetter(oid, format, targetType); ok {
 		return setter, nil
 	}
+	if setter, ok := pickCompositeSetter(oid, format, targetType); ok {
+		return setter, nil
+	}
 	// Array target: slice with PG array OID on the wire. Excludes
 	// []byte (handled as bytea in the binary path) so `text[]` into
 	// `[]byte` still fails loudly.
@@ -1190,6 +1193,122 @@ func nullSetterWrap(inner func(unsafe.Pointer, []byte) error, validOff uintptr) 
 		*validPtr = true
 		return nil
 	}
+}
+
+// --- Composite type support -------------------------------------------
+//
+// PostgreSQL composite (record) binary wire layout:
+//
+//	int32 ncols
+//	for each column:
+//	  int32 column OID
+//	  int32 length (-1 for NULL)
+//	  bytes value
+//
+// Fields are positional — the Nth wire column maps to the Nth
+// direct (non-embedded) exported field of the target Go struct.
+// Anonymous (embedded) struct fields are NOT flattened here: PG
+// composites have no concept of promotion, so "field N is the Nth
+// declared Go field, verbatim".
+//
+// Per-field setters are built lazily on the first row using the
+// OID declared in the wire plus the target Go field type, then
+// cached on the closure's fieldSetters slice. Subsequent rows
+// reuse the cache.
+//
+// Composites arrive as binary only when the caller has added the
+// composite's OID to Config.BinaryOIDs (the OID is user-assigned
+// by CREATE TYPE, so pg2json cannot know it statically). Columns
+// without binary format never reach this setter.
+func pickCompositeSetter(oid protocol.OID, format int16, t reflect.Type) (func(unsafe.Pointer, []byte) error, bool) {
+	if format != 1 {
+		return nil, false
+	}
+	if t.Kind() != reflect.Struct {
+		return nil, false
+	}
+	if t == timeType || t == rangeBytesType {
+		return nil, false
+	}
+	switch t {
+	case nullStringType, nullInt16Type, nullInt32Type, nullInt64Type,
+		nullFloat64Type, nullBoolType, nullTimeType, nullByteType:
+		return nil, false
+	}
+
+	type goFieldInfo struct {
+		offset uintptr
+		ftype  reflect.Type
+	}
+	var goFields []goFieldInfo
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if tag, ok := f.Tag.Lookup("pg2json"); ok && tag == "-" {
+			continue
+		}
+		goFields = append(goFields, goFieldInfo{offset: f.Offset, ftype: f.Type})
+	}
+	if len(goFields) == 0 {
+		return nil, false
+	}
+
+	fieldSetters := make([]func(unsafe.Pointer, []byte) error, len(goFields))
+	tSize := t.Size()
+
+	return func(fp unsafe.Pointer, raw []byte) error {
+		if raw == nil {
+			// Zero the whole destination struct.
+			b := unsafe.Slice((*byte)(fp), tSize)
+			for i := range b {
+				b[i] = 0
+			}
+			return nil
+		}
+		if len(raw) < 4 {
+			return fmt.Errorf("pg2json: composite header truncated")
+		}
+		ncols := int32(binary.BigEndian.Uint32(raw[0:4]))
+		raw = raw[4:]
+		if ncols < 0 {
+			return fmt.Errorf("pg2json: negative composite ncols %d", ncols)
+		}
+		for i := int32(0); i < ncols; i++ {
+			if len(raw) < 8 {
+				return fmt.Errorf("pg2json: composite field %d header truncated", i)
+			}
+			fieldOID := protocol.OID(binary.BigEndian.Uint32(raw[0:4]))
+			fieldLen := int32(binary.BigEndian.Uint32(raw[4:8]))
+			raw = raw[8:]
+			var fieldRaw []byte
+			if fieldLen != -1 {
+				if fieldLen < 0 || int(fieldLen) > len(raw) {
+					return fmt.Errorf("pg2json: bad composite field length %d at %d", fieldLen, i)
+				}
+				fieldRaw = raw[:fieldLen]
+				raw = raw[fieldLen:]
+			}
+			if int(i) >= len(goFields) {
+				// More PG fields than Go fields — skip the extra.
+				continue
+			}
+			if fieldSetters[i] == nil {
+				fs, err := pickSetter(fieldOID, 1, goFields[i].ftype)
+				if err != nil {
+					return fmt.Errorf("pg2json: composite field %d (OID %d) -> %s: %w",
+						i, fieldOID, goFields[i].ftype, err)
+				}
+				fieldSetters[i] = fs
+			}
+			fieldPtr := unsafe.Pointer(uintptr(fp) + goFields[i].offset)
+			if err := fieldSetters[i](fieldPtr, fieldRaw); err != nil {
+				return fmt.Errorf("pg2json: composite field %d: %w", i, err)
+			}
+		}
+		return nil
+	}, true
 }
 
 // --- Range type support -----------------------------------------------

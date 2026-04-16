@@ -119,6 +119,20 @@ type Config struct {
 	// bursts), but exposed for symmetry. 0 = kernel default.
 	TCPSendBuffer int
 
+	// BinaryOIDs lists PostgreSQL type OIDs for which the driver
+	// should always request binary result format, beyond the
+	// built-in set. Primary use is user-defined composite types:
+	// their OID is assigned at CREATE TYPE time so pg2json cannot
+	// know about them statically. Look up once (SELECT oid FROM
+	// pg_type WHERE typname = 'addr') and pass it here.
+	//
+	// When binary format is requested for an OID with no
+	// specialised decoder, JSON output of that column falls back
+	// to emitting the raw bytes as an opaque JSON string. The
+	// struct-scan path recognises composite wire format
+	// automatically when the target Go field is a struct.
+	BinaryOIDs []uint32
+
 	// RowsHint, if > 0, tells the driver roughly how many rows the query
 	// will return. After the first DataRow is encoded the driver grows
 	// the output buffer once to `firstRowBytes * RowsHint + slack`,

@@ -343,6 +343,19 @@ func (c *Client) prepareAndDescribe(sql string) (*preparedStmt, error) {
 				return nil, fmt.Errorf("pg2json: prepare returned no row description")
 			}
 			fmts := rows.PickResultFormats(plan.Columns)
+			// Upgrade columns whose OID matches Config.BinaryOIDs —
+			// primarily user-defined composite types the caller
+			// declared ahead of time.
+			if len(c.cfg.BinaryOIDs) > 0 {
+				for i, col := range plan.Columns {
+					for _, oid := range c.cfg.BinaryOIDs {
+						if protocol.OID(oid) == col.TypeOID {
+							fmts[i] = 1
+							break
+						}
+					}
+				}
+			}
 			plan.ApplyFormats(fmts)
 			return &preparedStmt{name: name, plan: plan, resultFmts: fmts}, nil
 		default:
