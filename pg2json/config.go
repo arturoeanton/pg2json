@@ -101,11 +101,32 @@ type Config struct {
 	// network connection. Messages whose total length (5-byte header +
 	// body) fits inside this buffer take a zero-copy fast path via Peek;
 	// larger messages fall back to a copy through an internal scratch
-	// slice. Default 64 KiB, which covers essentially all DataRow /
+	// slice. Default 128 KiB, which covers essentially all DataRow /
 	// RowDescription / auth messages. Raise only if you know your
-	// workload returns cells larger than 64 KiB that would otherwise
+	// workload returns cells larger than 128 KiB that would otherwise
 	// trigger the copy fallback on every row. Minimum 4 KiB enforced.
 	WireReadBufferSize int
+
+	// TCPRecvBuffer, if > 0, sets SO_RCVBUF on the dialed TCP socket via
+	// net.TCPConn.SetReadBuffer. On LAN with non-trivial RTT and wide
+	// rows this is the single biggest wire-level knob: the default kernel
+	// receive window saturates at a few hundred KB in practice, and the
+	// server stalls on ACK. Typical useful values: 1–4 MiB. 0 leaves the
+	// kernel default. Ignored for non-TCP transports.
+	TCPRecvBuffer int
+	// TCPSendBuffer is the matching SO_SNDBUF knob for outbound traffic.
+	// Rarely useful for this driver (we send small Bind/Execute/Sync
+	// bursts), but exposed for symmetry. 0 = kernel default.
+	TCPSendBuffer int
+
+	// RowsHint, if > 0, tells the driver roughly how many rows the query
+	// will return. After the first DataRow is encoded the driver grows
+	// the output buffer once to `firstRowBytes * RowsHint + slack`,
+	// avoiding the repeated doubling-and-copy cost of append() on large
+	// result sets. Buffered (QueryJSON) mode is where this pays off;
+	// streaming mode caps growth at ~2× FlushBytes because anything
+	// above the flush threshold just delays the flush. 0 = disabled.
+	RowsHint int
 }
 
 func (c *Config) applyDefaults() {
@@ -134,7 +155,7 @@ func (c *Config) applyDefaults() {
 		c.Keepalive = 30 * time.Second
 	}
 	if c.WireReadBufferSize <= 0 {
-		c.WireReadBufferSize = 64 * 1024
+		c.WireReadBufferSize = 128 * 1024
 	} else if c.WireReadBufferSize < 4*1024 {
 		c.WireReadBufferSize = 4 * 1024
 	}
@@ -204,6 +225,15 @@ func ParseDSN(dsn string) (Config, error) {
 	q := u.Query()
 	if app := q.Get("application_name"); app != "" {
 		cfg.ApplicationName = app
+	}
+	if v := q.Get("tcp_recv_buffer"); v != "" {
+		cfg.TCPRecvBuffer, _ = strconv.Atoi(v)
+	}
+	if v := q.Get("tcp_send_buffer"); v != "" {
+		cfg.TCPSendBuffer, _ = strconv.Atoi(v)
+	}
+	if v := q.Get("wire_read_buffer"); v != "" {
+		cfg.WireReadBufferSize, _ = strconv.Atoi(v)
 	}
 	switch q.Get("sslmode") {
 	case "disable":

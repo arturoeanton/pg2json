@@ -66,6 +66,12 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	// coalescing benefit here.
 	if tcp, ok := nc.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
+		if cfg.TCPRecvBuffer > 0 {
+			_ = tcp.SetReadBuffer(cfg.TCPRecvBuffer)
+		}
+		if cfg.TCPSendBuffer > 0 {
+			_ = tcp.SetWriteBuffer(cfg.TCPSendBuffer)
+		}
 	}
 	// Push the ctx deadline (or DialTimeout, if ctx has none) into the
 	// socket for the duration of the handshake so reads during TLS / auth

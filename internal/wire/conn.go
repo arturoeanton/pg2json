@@ -33,8 +33,10 @@ const (
 // below — that's the slice we alias into and return from ReadMessage;
 // the bufio just feeds it from userspace, not from the kernel each time.
 // DefaultReaderBufSize is the default bufio.Reader size used when the
-// caller does not override it via Config.WireReadBufferSize.
-const DefaultReaderBufSize = 64 * 1024
+// caller does not override it via Config.WireReadBufferSize. 128 KiB
+// covers essentially every DataRow shape while fitting comfortably in
+// L2 on current hardware.
+const DefaultReaderBufSize = 128 * 1024
 
 type Conn struct {
 	nc       net.Conn
