@@ -1,19 +1,37 @@
 # pg2json
 
-**`SELECT` → JSON bytes. No intermediate Go types. Built for dynamic data
-gateways where the only consumer of a row is JSON.**
+**`SELECT` → JSON bytes (primary path) or `SELECT` → typed Go structs
+(narrow secondary path). No intermediate `map[string]any`. Built for
+dynamic data gateways where the only consumer of a row is JSON, and for
+read-path code that wants structs without the pgx ceremony.**
 
 ```go
+// JSON bytes — the original mission.
 buf, err := c.QueryJSON(ctx, "SELECT id, name, meta FROM users WHERE id = $1", 42)
 // buf == [{"id":42,"name":"alice","meta":{"k":42}}]
+
+// Typed structs — added for SELECT-only apps that want to beat pgx on
+// the read path without giving up struct ergonomics.
+type User struct {
+    Id    int32
+    Name  string
+    Meta  json.RawMessage
+}
+users, err := pg2json.ScanStruct[User](c, ctx,
+    "SELECT id, name, meta FROM users WHERE id = ANY($1)", ids)
 ```
 
-The row above never becomes a `struct`, a `map[string]any`, or goes through
-`json.Marshal`. Bytes flow from the Postgres wire directly into a JSON
-output buffer via per-OID encoders that allocate zero bytes per cell.
+The JSON path never goes through a `struct`, a `map[string]any`, or
+`json.Marshal`. Bytes flow from the Postgres wire directly into the JSON
+buffer via per-OID encoders that allocate zero bytes per cell.
 
-Anything that is not a `SELECT` is rejected at the API. This is not a
-general-purpose driver, not `database/sql`-compatible, and not an ORM.
+The struct path compiles a per-shape plan once (reflection at
+RowDescription time, never per row) and fills `[]T` through
+`unsafe.Pointer` + typed setters. Supported cell→field mappings cover
+scalars, pointer-for-NULL, `sql.Null*`, any `sql.Scanner`, and 1-D PG
+arrays. Anything beyond that (INSERT/UPDATE/DELETE, transactions,
+`database/sql` compat, composite/range types, multi-dim arrays) is out
+of scope by design — delegate those to pgx.
 
 ---
 
@@ -24,9 +42,11 @@ Pick the tool that matches what you're doing with the rows in Go:
 | workload                                                             | recommendation              |
 |----------------------------------------------------------------------|-----------------------------|
 | Read rows, run business logic in Go, write back                      | **pgx** (or `database/sql`) |
-| Scan into typed structs, validate, transform, respond with JSON      | **pgx + `encoding/json`**   |
-| Read rows and forward them as JSON without touching them in Go       | **pg2json**                 |
+| Read rows and forward them as JSON without touching them in Go       | **pg2json** (QueryJSON / StreamNDJSON / StreamTOON) |
+| Scan into typed structs of plain types + `sql.Null*` / Scanner / 1-D arrays | **pg2json.ScanStruct[T]** (1.1–1.35× vs pgx.CollectRows, 3–5× fewer allocs) |
+| Scan into structs with composite types, range types, multi-dim arrays, or custom pgtype wrappers | **pgx**                     |
 | Mixed INSERT/UPDATE/DELETE with SELECT inside a single transaction   | **pgx** (pg2json rejects non-SELECT at the API) |
+| Feeding tabular data to an LLM or agent pipeline with a token budget | **pg2json.StreamTOON** (30–50% fewer bytes/tokens than NDJSON) |
 
 If a single code path between the DB read and the JSON write needs the
 values as Go types, the advantage disappears. Use pgx.
@@ -58,10 +78,16 @@ these fits it:
 
 ### Doesn't fit
 
-- Authorization or filtering logic that inspects row values in Go.
-- Transactions with mixed INSERT/UPDATE/DELETE.
-- Struct mapping, ORM features, `sqlc`-style code generation.
+- Transactions with mixed INSERT/UPDATE/DELETE (delegate to pgx).
+- ORM features, `sqlc`-style code generation (use pgx + sqlc).
+- Struct fields that require `pgtype.*` wrappers, composite/range types,
+  multi-dim arrays, or custom `driver.Valuer` on the write side.
+- `database/sql` drop-in compatibility.
 - Computed fields that require Go (use SQL expressions instead — still fits).
+
+For any of the above, use pgx directly (or run a separate pgx pool
+alongside pg2json — they coexist without interfering, both pointing at
+the same PG).
 
 ---
 
@@ -142,6 +168,42 @@ the column types at compile time. The ceiling is informative (it says
 pg2json is at the wire-throughput limit, not leaving performance on the
 table); it is not a realistic alternative to compare against.
 
+### Output modes: NDJSON vs Columnar vs TOON (100k rows, same query)
+
+All three write to the same `io.Writer`. NDJSON is one object per line.
+Columnar is `{"columns":[...], "rows":[[...]]}`. TOON is a header line
+followed by value-only rows, for LLM / agent consumers on a token
+budget.
+
+| shape       | NDJSON B/row | Columnar B/row | TOON B/row | TOON vs NDJSON |
+|-------------|--------------|-----------------|------------|-----------------|
+| narrow_int  | 12.9         | 7.9             | **5.9**    | **−54%**        |
+| mixed_5col  | 87.6         | 53.6            | **51.6**   | **−41%**        |
+| wide_jsonb  | 51.9         | 42.9            | **40.9**   | −21%            |
+| array_int   | 79.8         | 68.8            | **66.8**   | −16%            |
+| null_heavy  | 25.3         | 16.3            | **14.3**   | **−43%**        |
+
+Wall time on loopback is identical across the three modes (we're
+wire-bound by PG). The byte savings translate to wall time on LAN/WAN
+where the wire is the bottleneck (~20–35% less transmission time for
+typical row shapes at 1 Gbps).
+
+### Struct scan (ScanStruct[T]) vs pgx — 100k rows, binary format both sides
+
+| shape       | pg2json ScanStruct[T]           | pgx + rs.Scan(&f…) manual           | pgx.CollectByName                    |
+|-------------|---------------------------------|--------------------------------------|---------------------------------------|
+| narrow_int  | 7.9 ms, **34 allocs**, 1.0 MB   | —                                    | 8.7 ms, 200k allocs, 4.0 MB           |
+| mixed_5col  | 32 ms, **200k allocs**, 20 MB   | 30 ms, 600k allocs, 33 MB            | 43 ms, 700k allocs, 70 MB             |
+| wide_jsonb  | 34 ms, **100k allocs**, 13 MB   | —                                    | 45 ms, 700k allocs, 47 MB             |
+
+vs `pgx.CollectRows[StructByName]` (the ergonomic pgx path): **1.1–1.35×
+faster wall time, 3.5–5900× fewer allocations** depending on shape.
+
+vs `rs.Scan(&f1, &f2, ...)` (the verbose fast pgx path): **wall-time
+parity within noise, 3× fewer allocations**. Wall time is tied because
+both paths are wire-bound by PG; pg2json wins on GC pressure under
+high-QPS loads and on total memory footprint.
+
 ### Hot-path microbenchmarks
 
 | benchmark                                 | ns/op | B/op | allocs |
@@ -168,6 +230,24 @@ buf, err := c.QueryJSON(ctx, "SELECT id, name FROM users WHERE id = $1", 42)
 
 // Streaming: writes directly to an http.ResponseWriter
 err = c.StreamNDJSON(ctx, w, "SELECT id, name FROM users")
+
+// Output modes — pick based on consumer:
+//   StreamJSON      → [{...},{...},...]              (array, typical REST body)
+//   StreamNDJSON    → {...}\n{...}\n...              (line-delimited, Kafka / jq / tail)
+//   StreamColumnar  → {"columns":[...],"rows":[...]} (AG Grid / DataTables / spreadsheet)
+//   StreamTOON      → [?]{col}\nval,val\n...         (LLM agents, token-bound consumers)
+
+// Struct scan — fill []T directly from the wire. Generic, no reflect
+// per row, unsafe.Pointer setters. Supports sql.Null*, sql.Scanner,
+// pointer-for-NULL, 1-D arrays. Falls fast on anything else.
+type User struct {
+    Id    int32
+    Name  string
+    Email sql.NullString
+    Tags  []string          // text[] → []string
+}
+users, err := pg2json.ScanStruct[User](c, ctx,
+    "SELECT id, name, email, tags FROM users WHERE active = true")
 ```
 
 ### Pool (production)
@@ -445,7 +525,68 @@ func TestOrdersListShape(t *testing.T) {
 }
 ```
 
-### 10. Graceful shutdown on SIGTERM
+### 10. Struct scan: typed results without the pgx ceremony
+
+```go
+// Feed a ranked list to the recommendation service. Plain struct
+// fields + sql.Null* + 1-D array are all that's needed 90% of the
+// time — use pg2json.ScanStruct and skip pgx + CollectRows entirely.
+type Candidate struct {
+    Id      int64
+    Handle  string
+    Score   float64
+    Email   sql.NullString    // nullable column
+    Tags    []string          // text[]
+    Seen    time.Time
+}
+
+func rank(ctx context.Context, c *pg2json.Client, since time.Time) ([]Candidate, error) {
+    return pg2json.ScanStruct[Candidate](c, ctx,
+        `SELECT id, handle, score, email, tags, last_seen AS seen
+         FROM candidates WHERE last_seen >= $1 ORDER BY score DESC LIMIT 500`,
+        since)
+}
+```
+
+Field matching uses a `pg2json:"col_name"` tag if present, else the
+field name case-insensitively. Columns with no matching field are
+skipped; fields with no matching column stay at their zero value.
+
+For custom types (e.g. `uuid.UUID`, `decimal.Decimal`, domain wrappers),
+implement `sql.Scanner` on `*T` and ScanStruct routes through it —
+same contract as `database/sql`.
+
+### 11. Delegate to pgx for writes and transactions
+
+```go
+// pg2json owns the read path; pgx owns everything else. Two pools,
+// same PG, no shared state — they coexist cleanly.
+var (
+    readDB  *pg2json.Pool  // SELECT / reads
+    writeDB *pgxpool.Pool  // INSERT / UPDATE / DELETE / BEGIN
+)
+
+// Hot read — pg2json.
+func getUsers(ctx context.Context) ([]User, error) {
+    c, _ := readDB.Acquire(ctx); defer c.Release()
+    return pg2json.ScanStruct[User](c, ctx, `SELECT ... FROM users ...`)
+}
+
+// Write — pgx (transactions, RETURNING, pgtype, everything).
+func createOrder(ctx context.Context, o Order) (int64, error) {
+    tx, err := writeDB.Begin(ctx); if err != nil { return 0, err }
+    defer tx.Rollback(ctx)
+    var id int64
+    err = tx.QueryRow(ctx,
+        `INSERT INTO orders (...) VALUES (...) RETURNING id`,
+        o.Args()...,
+    ).Scan(&id)
+    if err != nil { return 0, err }
+    return id, tx.Commit(ctx)
+}
+```
+
+### 12. Graceful shutdown on SIGTERM
 
 ```go
 func main() {
@@ -475,6 +616,7 @@ func main() {
 pg2json/
 ├── pg2json/                 # public API
 │   ├── conn.go query.go stream.go config.go errors.go
+│   ├── scan.go              # ScanStruct[T] — struct scan path
 │   ├── stmtcache.go         # per-connection prepared-statement cache
 │   ├── ctx.go               # context cancel → CancelRequest watcher
 │   ├── observer.go          # telemetry hook + atomic counters
@@ -483,15 +625,16 @@ pg2json/
 │   ├── wire/                # framed reader/writer over net.Conn (bufio)
 │   ├── protocol/            # message codes + OIDs
 │   ├── auth/                # MD5 + SCRAM-SHA-256 (stdlib only)
-│   ├── rows/                # plan compile + DataRow hot loop
-│   ├── types/               # text + binary encoders per OID; arrays; interval
+│   ├── rows/                # plan compile + DataRow hot loop (JSON + TOON)
+│   ├── types/               # text + binary encoders per OID; arrays; interval; numeric
 │   ├── jsonwriter/          # direct-to-[]byte appender + escape table
 │   ├── bufferpool/          # sync.Pool of []byte
 │   └── pgerr/               # ErrorResponse / NoticeResponse decoder
+├── docker/                  # docker-compose + seeded benchmark tables
 ├── cmd/
 │   ├── pg2json_demo/        # CLI: SELECT → JSON (PG2JSON_DSN)
 │   └── pg2json_bench/       # end-to-end perf harness
-└── tests/                   # integration, comparison, PgBouncer rotation
+└── tests/                   # integration, comparison, PgBouncer rotation, scan, TOON
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md) for
@@ -525,14 +668,25 @@ design rationale and pending work.
 - **No COPY binary fast-export yet.** A `COPY (SELECT ...) TO STDOUT
   WITH (FORMAT binary)` path would beat the extended-query path for
   bulk-export workloads. Not implemented; on the roadmap.
-- **Numeric is text-format only.** PG's binary numeric format is a packed
-  decimal requiring non-trivial decoding; text works correctly (the PG
-  text form is already JSON-number-shaped).
+- **Numeric binary decoder ships as an opt-in utility
+  (`types.EncodeNumericBinary`) but is not auto-selected.** On loopback
+  and typical precisions PG's C-side text formatter beats the Go
+  decoder — wire it in manually if your workload shows text numeric
+  dominating.
+- **ScanStruct scope is deliberately narrow.** Supports scalars,
+  pointer-for-NULL, `sql.Null*`, any `sql.Scanner`, and 1-D arrays.
+  Does NOT support composite types, range types, multi-dim arrays,
+  `pgtype.*` wrappers, embedded structs. Hit any of those → use pgx.
+- **`database/sql` adapter not implemented.** If you need
+  `sql.Open("pg2json", ...)` today, use pgx through its stdlib
+  adapter; pg2json exposes its own API only.
+- **Writes are out of scope.** INSERT/UPDATE/DELETE/LISTEN/COPY/replication
+  are rejected at the API or not implemented. Delegate to pgx — two
+  pools to the same PG coexist cleanly.
 - **Performance claims are against the specific workload shape
-  measured.** Run `cmd/pg2json_bench` and `tests/BenchmarkPgx` on your
-  own data shapes, on your own hardware. Numbers move.
-- **This is a SELECT driver.** INSERT/UPDATE/DELETE/LISTEN/COPY/replication
-  are rejected at the API or not implemented. That's the point.
+  measured.** Run `cmd/pg2json_bench` and `tests/BenchmarkPgx` /
+  `tests/BenchmarkScan` on your own data shapes, on your own hardware.
+  Numbers move.
 - **No 8-hour / 500k-user soak test yet.** Design targets that workload,
   and the benchmark suite plus fuzz tests cover correctness under
   bursts, but real-world validation is pending. Pin to `v0.x` and
