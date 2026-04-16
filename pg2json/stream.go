@@ -27,23 +27,45 @@ type outWriter interface {
 	Committed() bool
 	Reset()
 	BytesOut() int
+	// GrowForRow is called once after the first DataRow has been
+	// encoded, with `rowBytes` set to the byte size of that row. The
+	// implementation may grow the backing buffer to reduce append
+	// doubling cost for large result sets. It is a no-op unless a
+	// RowsHint was configured.
+	GrowForRow(rowBytes int)
 }
 
 // bufWriter is the QueryJSON path: append into a pooled []byte and never
 // flush. Flush() is a no-op.
 type bufWriter struct {
-	p *[]byte
+	p        *[]byte
+	rowsHint int
+	grew     bool
 }
 
-func (b *bufWriter) Buf() []byte                  { return *b.p }
-func (b *bufWriter) SetBuf(p []byte)              { *b.p = p }
-func (b *bufWriter) Write(p []byte) (int, error)  { *b.p = append(*b.p, p...); return len(p), nil }
-func (b *bufWriter) WriteByte(c byte) error       { *b.p = append(*b.p, c); return nil }
-func (b *bufWriter) MaybeFlush() error            { return nil }
-func (b *bufWriter) Flush() error                 { return nil }
-func (b *bufWriter) Committed() bool              { return false } // never until QueryJSON returns
-func (b *bufWriter) Reset()                       { *b.p = (*b.p)[:0] }
-func (b *bufWriter) BytesOut() int                { return len(*b.p) }
+func (b *bufWriter) Buf() []byte                 { return *b.p }
+func (b *bufWriter) SetBuf(p []byte)             { *b.p = p }
+func (b *bufWriter) Write(p []byte) (int, error) { *b.p = append(*b.p, p...); return len(p), nil }
+func (b *bufWriter) WriteByte(c byte) error      { *b.p = append(*b.p, c); return nil }
+func (b *bufWriter) MaybeFlush() error           { return nil }
+func (b *bufWriter) Flush() error                { return nil }
+func (b *bufWriter) Committed() bool             { return false } // never until QueryJSON returns
+func (b *bufWriter) Reset()                      { *b.p = (*b.p)[:0] }
+func (b *bufWriter) BytesOut() int               { return len(*b.p) }
+
+func (b *bufWriter) GrowForRow(rowBytes int) {
+	if b.grew || b.rowsHint <= 0 || rowBytes <= 0 {
+		return
+	}
+	b.grew = true
+	want := rowBytes*b.rowsHint + 256
+	if cap(*b.p) >= want {
+		return
+	}
+	newBuf := make([]byte, len(*b.p), want)
+	copy(newBuf, *b.p)
+	*b.p = newBuf
+}
 
 // flushingWriter accumulates into a buffer and flushes to the underlying
 // writer once the buffer crosses `threshold` OR `interval` has elapsed
@@ -59,6 +81,8 @@ type flushingWriter struct {
 	src       *[]byte // pool source so we can return it on close
 	committed bool    // any flush has happened
 	written   int     // total bytes flushed downstream
+	rowsHint  int
+	grew      bool
 }
 
 func (f *flushingWriter) Buf() []byte     { return f.buf }
@@ -108,6 +132,28 @@ func (f *flushingWriter) Reset() {
 		return
 	}
 	f.buf = f.buf[:0]
+}
+
+// GrowForRow grows the flushing buffer up to ~2× threshold so the first
+// flush worth of rows lands without repeated append doublings. We cap at
+// 2× threshold because anything larger just sits in the buffer past the
+// flush point and hurts first-byte latency downstream.
+func (f *flushingWriter) GrowForRow(rowBytes int) {
+	if f.grew || f.rowsHint <= 0 || rowBytes <= 0 {
+		return
+	}
+	f.grew = true
+	want := rowBytes*f.rowsHint + 256
+	cap2x := f.threshold * 2
+	if cap2x > 0 && want > cap2x {
+		want = cap2x
+	}
+	if cap(f.buf) >= want {
+		return
+	}
+	newBuf := make([]byte, len(f.buf), want)
+	copy(newBuf, f.buf)
+	f.buf = newBuf
 }
 
 func (f *flushingWriter) releaseBuf() {

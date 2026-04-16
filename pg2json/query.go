@@ -75,7 +75,7 @@ func (c *Client) QueryJSON(ctx context.Context, sql string, args ...any) ([]byte
 	bp := bufferpool.Get()
 	defer bufferpool.Put(bp)
 	*bp = (*bp)[:0]
-	w := &bufWriter{p: bp}
+	w := &bufWriter{p: bp, rowsHint: c.cfg.RowsHint}
 	if err := c.runQuery(ctx, w, ModeArray, sql, args); err != nil {
 		return nil, err
 	}
@@ -108,6 +108,7 @@ func (c *Client) newFlushWriter(w io.Writer) *flushingWriter {
 		buf:       *bp,
 		src:       bp,
 		lastFlush: time.Now(),
+		rowsHint:  c.cfg.RowsHint,
 	}
 }
 
@@ -527,6 +528,7 @@ func writeHeader(out outWriter, mode Mode, plan *rows.Plan) error {
 
 func writeRow(out outWriter, mode Mode, plan *rows.Plan, body []byte, idx int) error {
 	scratch := out.Buf()
+	startLen := len(scratch)
 	switch mode {
 	case ModeArray:
 		if idx > 0 {
@@ -555,6 +557,9 @@ func writeRow(out outWriter, mode Mode, plan *rows.Plan, body []byte, idx int) e
 		}
 	}
 	out.SetBuf(scratch)
+	if idx == 0 {
+		out.GrowForRow(len(scratch) - startLen)
+	}
 	return out.MaybeFlush()
 }
 
