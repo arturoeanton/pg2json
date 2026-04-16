@@ -144,7 +144,8 @@ decoder; text is the correctness-preserving fallback.
 | date, time, timetz | binary | ISO string | `time.Time` |
 | timestamp, timestamptz | binary | ISO 8601 string | `time.Time` |
 | interval | binary | ISO 8601 duration | `string` |
-| arrays (1-D) | binary | nested JSON arrays | `[]T` of the above |
+| arrays (1-D, 2-D) | binary | nested JSON arrays | `[]T` / `[][]T` of the above |
+| ranges (`int4range`, `tstzrange`, …) | binary | quoted string (JSON paths) | `pg2json.RangeBytes` |
 | anything else | text | escaped string (correct) | `string` |
 
 `NULL` is emitted as JSON `null` or, in struct scan, zero-value / nil
@@ -153,11 +154,22 @@ routed through `Scan(any)` with the `database/sql` canonical
 intermediate — `uuid.UUID`, `decimal.Decimal`, and your domain types
 all work without pg2json-specific wiring.
 
-Explicitly not (yet) supported in struct scan: composite types
-(`ROW(a,b)`), range types (`int4range`), multi-dim arrays,
-`pgtype.*` wrappers, embedded structs. The JSON paths handle all of
-these via text fallback; use the native API for now if you need them
-in struct form.
+Also supported in struct scan:
+
+- **Embedded structs** — anonymous struct fields flatten following
+  Go's own promotion rule (outer shadows embedded duplicates).
+- **2-D arrays** — `[][]int32` etc. from `int4[][]` and friends.
+  3-D+ targets fail fast with a clear error.
+- **Range types** — `int4range` / `int8range` / `numrange` /
+  `tsrange` / `tstzrange` / `daterange` via the `pg2json.RangeBytes`
+  target. The struct exposes the raw bound bytes plus the flags
+  (empty, inclusive, infinite on each side). Decode bounds further
+  with `pg2json.DriverValueDecoder` on the element OID.
+
+Not supported in struct scan (use your other driver or an
+`sql.Scanner` custom type): composite types (`ROW(a,b,c)`), 3-D+
+arrays, `pgtype.*` wrappers. The JSON output paths handle all of
+these safely via text fallback.
 
 ---
 
@@ -264,7 +276,7 @@ Key features for production:
 | Bulk read that would OOM with a plain slice | `ScanStructBatched[T]` |
 | Read rows and forward them to an HTTP / queue / cache | either path |
 | Writes, transactions, LISTEN/NOTIFY, COPY | keep your existing driver |
-| Composite, range, multi-dim array types | keep your existing driver |
+| Composite (`ROW(…)`) or 3-D+ arrays | keep your existing driver |
 
 ---
 
@@ -339,6 +351,40 @@ func createOrder(ctx context.Context, o Order) (int64, error) {
 
 Same Postgres, two pools, clean separation of concerns.
 
+### Embedded structs, 2-D arrays, range types
+
+```go
+type Audit struct {
+    CreatedAt time.Time
+    UpdatedAt time.Time
+}
+type Product struct {
+    Audit                   // flattened — rows with created_at / updated_at
+    ID    int64
+    Name  string
+    Sizes [][]int32         // 2-D array: grid of available sizes
+    Span  pg2json.RangeBytes `pg2json:"availability"` // a tstzrange column
+}
+
+prods, err := pg2json.ScanStruct[Product](c, ctx, `
+    SELECT id, name, sizes, availability, created_at, updated_at
+    FROM products WHERE active = $1`, true)
+
+// prods[0].Audit.CreatedAt ← from created_at
+// prods[0].Sizes           ← [[S,M],[L,XL]] as [][]int32
+// prods[0].Span.Empty      ← true for empty range
+// prods[0].Span.Lower      ← raw wire bytes of the lower bound
+// prods[0].Span.Upper      ← raw wire bytes of the upper bound
+```
+
+Decode a range bound further with the OID decoder helper:
+
+```go
+// For a tstzrange:
+decode := pg2json.DriverValueDecoder(/*tstz*/ 1184, /*binary*/ 1)
+lower := decode(prods[0].Span.Lower).(time.Time)
+```
+
 ### Drop-in for `sqlc`-generated or legacy code
 
 ```go
@@ -362,10 +408,11 @@ db, _ := sql.Open("pg2json", dsn)
 - **Read-only by design.** INSERT / UPDATE / DELETE / LISTEN / NOTIFY
   / COPY / replication are rejected at the API or not implemented.
   Keep a write driver for those.
-- **Struct scan scope.** Covers scalars, pointer-for-NULL, `sql.Null*`,
-  any `sql.Scanner`, and 1-D arrays. Composite, range, multi-dim,
-  `pgtype.*`, embedded structs are not in scope yet — use your write
-  driver's scan path for those shapes.
+- **Struct scan scope.** Covers scalars, pointer-for-NULL,
+  `sql.Null*`, any `sql.Scanner`, 1-D and 2-D arrays, embedded
+  structs, and range types (via `pg2json.RangeBytes`). Composite
+  types (`ROW(a,b)`), 3-D+ arrays, and `pgtype.*` wrappers are not
+  in scope — use pgx's scan path for those shapes.
 - **Numeric uses text format.** Binary numeric decoder ships as an
   opt-in utility (`types.EncodeNumericBinary`) but is not
   auto-selected; on loopback the text path is faster.
