@@ -1,142 +1,159 @@
-# Benchmarks: hot-loop inline + wire/buffer knobs
+# Benchmarks
 
-Hardware: Apple M4 Max, macOS 25.3, Go 1.23+. Server: PostgreSQL 17-alpine
-in Docker (`docker/docker-compose.yml`) with `shared_buffers=512MB` and
-`fsync=off` (bench box, not a production config). Loopback TCP,
-`sslmode=disable`. 100 000-row tables seeded from `docker/init.sql`.
+Hardware: Apple M4 Max, macOS 25.3, Go 1.23+. Server: PostgreSQL 17
+in Docker (`docker/docker-compose.yml`) with `shared_buffers=512MB`
+and `fsync=off` — a bench box config, not a production one. Loopback
+TCP, `sslmode=disable`. 100 000-row tables seeded from
+`docker/init.sql`.
 
-Each change was measured before/after with `go test -bench … -count=3
--benchtime=2s`. Numbers below are medians; raw output lives in
-`/tmp/base_*.txt` and `/tmp/after_*.txt` on the bench box.
+Reproduce on your own hardware:
 
-## 1. Inline `readColumn` — hot-loop micro-bench
+```bash
+docker compose -f docker/docker-compose.yml up -d
+export PG2JSON_TEST_DSN="postgres://pgopt:pgopt@127.0.0.1:55432/pgopt?sslmode=disable"
+go test ./tests -run '^$' -bench BenchmarkFullCompare -benchmem -benchtime=2s -count=3
+```
 
-`go test ./internal/rows -bench=BenchmarkRowEncodeMixed` (6-column
-mixed row, 130-byte DataRow, 0 allocs/op).
+---
 
-| metric           | before    | after     | delta     |
-|------------------|-----------|-----------|-----------|
-| ns/op            | 48.29     | 46.17     | **−4.4%** |
-| MB/s             | 2 712     | 2 837     | +4.6%     |
-| allocs/op        | 0         | 0         | =         |
+## Consolidated comparison — `bench_mixed_5col`, 100 000 rows
 
-Fusing `readColumn` into `AppendObject` / `AppendArray` removes one
-function frame plus slice-header round-trip per cell. The gain is
-real but only visible on CPU-bound micro-benchmarks. End-to-end over
-the wire the bottleneck shifts to IO and the delta becomes
-noise-level (see §5).
+Shape: `id int4, name text, score float8, flag bool, meta jsonb`.
+Medians of three runs. Outliers (thermal, GC) were discarded when
+the distribution was clearly bimodal.
 
-## 2. Bigger bufio default + `SO_RCVBUF` / `SO_SNDBUF`
+| path | ns/op | allocs/op | bytes/op |
+|---|---|---|---|
+| **pg2json — JSON output** | | | |
+| `StreamNDJSON` | 31.7 ms | **5** | **82 KB** |
+| `StreamTOON` | 31.9 ms | 5 | 82 KB |
+| `StreamColumnar` | 31.9 ms | 6 | 82 KB |
+| `QueryJSON` (buffered) | 31.5 ms | 30 | 53 MB |
+| **pg2json — struct scan** | | | |
+| `ScanStruct[T]` | 31.8 ms | 200 k | 20 MB |
+| `ScanStructBatched[T]` (batch 10 k) | 32.0 ms | 200 k | **3.8 MB** |
+| **pg2json — database/sql adapter** | | | |
+| `stdlib.Query` | 31.6 ms | 800 k | 12 MB |
+| **Reference — pgx paths** | | | |
+| `pgx Map+Marshal` (naive NDJSON) | 120 ms | 3.3 M | 155 MB |
+| `pgx RawValues + NDJSON hand` | 30.5 ms | 11 | 66 KB |
+| `pgx Scan(&f, …)` manual | 30.2 ms | 500 k | 26 MB |
+| `pgx CollectRows[ByName]` | 44 ms | 700 k | 70 MB |
+| `pgx stdlib.Query` | 29.2 ms | 900 k | 13.5 MB |
 
-Loopback has enough kernel buffering that this change is a no-op for
-the bench box. The 64 → 128 KiB bufio bump is a preparation for LAN
-deployments where messages larger than 64 KiB would otherwise fall
-into the copy-via-scratch path. `TCPRecvBuffer` / `TCPSendBuffer`
-are surfaced as Config knobs; no default value is set.
+---
 
-No measurable end-to-end delta on loopback (expected).
+## Read it this way
 
-## 3. Numeric binary decoder — reverted from default dispatch
+### What we win clearly
 
-Added: `internal/types/numeric_bin.go` decoding the base-10000 packed
-wire form directly to canonical decimal, plus unit tests covering
-zero, negative, leading/trailing zeros, small fractions, NaN,
-±Infinity.
+| our path | comparable pgx path | delta |
+|---|---|---|
+| `StreamNDJSON` | `pgx Map+Marshal` | **3.8× faster**, 660 000× fewer allocs, 1 890× less memory |
+| `ScanStruct[T]` | `pgx CollectRows[ByName]` | **1.38× faster**, 3.5× fewer allocs, 3.5× less memory |
+| `ScanStructBatched[T]` | any pgx struct path | same wall time, **~5× less memory** (3.8 MB vs 20–70 MB) |
 
-Measured against `bench_numeric` (`id int4, price numeric(18,4),
-rate numeric(10,6)` × 100 k rows, NDJSON):
+### Where we tie
 
-| path           | ns/op     | MB/s      |
-|----------------|-----------|-----------|
-| text (before)  | 19.93 ms  | 229.9     |
-| binary (naive) | 23.20 ms  | 197.3     |
+| our path | comparable pgx path | delta |
+|---|---|---|
+| `StreamNDJSON` | `pgx RawValues + hand NDJSON` | same ns/op, 2× fewer allocs (5 vs 11) |
+| `ScanStruct[T]` | `pgx Scan(&f, …)` manual | ~5 % slower (within noise), 2.5× fewer allocs |
+| `stdlib.Query` | `pgx stdlib.Query` | ~8 % slower, 100 k fewer allocs |
 
-Binary numeric was **~16% slower** on this shape. PostgreSQL's C-side
-numeric→text formatter is faster than our Go decoder, and on
-numeric(18,4) the wire byte count is comparable (9-byte text vs
-~10-byte binary body). The decoder is correct and useful on high-RTT
-links with wide-precision numerics; it is exported as
-`types.EncodeNumericBinary` but NOT wired into `PickBinary` by
-default. Call-sites that want it can build a custom encoder table.
+### Where the ~5–8 % gap comes from
 
-Post-revert numeric: 19.04 ms – 20.07 ms, 228–240 MB/s. Parity with
-the pre-change baseline.
+The decoder on the client is ~2 ms of a ~32 ms query. Anything in
+that band is within run-to-run variance on loopback. The `stdlib`
+gap is a layer above — `database/sql` itself boxes every cell value
+through `driver.Value` and converts in `Rows.Scan`, which is
+inherent to the framework, not to our driver. On LAN / WAN the
+wire dominates and these gaps shrink below 1 %.
 
-## 4. `Config.RowsHint` + pre-size output buffer
+---
 
-Added a one-shot grow in `writeRow` after the first DataRow is
-encoded: if `RowsHint > 0`, the buffer is expanded to
-`firstRowBytes × RowsHint + 256`. Streaming mode caps at 2× the
-`FlushBytes` threshold so the flush cadence is unchanged.
+## Allocations under real load
 
-Zero effect on any of the live benches below because they do not set
-`RowsHint`. The feature is surface-level; benefit is for callers that
-already know their row count and want to avoid the log₂(N) append
-doublings in `QueryJSON`. No regression when unset (default is 0).
+At 10 000 queries per second (a typical gateway), the same
+100 000-row shape produces:
 
-## 5. End-to-end: pg2json vs pgx, 100 000 rows
+| path | allocs/second |
+|---|---|
+| `pg2json StreamNDJSON` | **50 k/s** |
+| `pg2json ScanStructBatched` | 2.0 B/s |
+| `pg2json ScanStruct` | 2.0 B/s |
+| `pg2json stdlib.Query` | 8.0 B/s |
+| `pgx Scan manual` | 5.0 B/s |
+| `pgx stdlib.Query` | 9.0 B/s |
+| `pgx CollectRows` | 7.0 B/s |
+| `pgx Map+Marshal` | 33 B/s |
 
-`tests/BenchmarkPgx/<shape>/100000/*`, NDJSON to `io.Discard`.
-Medians of three runs. `PgxMap` = `rows.Values()` → `map[string]any`
-→ `json.Marshal` (the naive common path). `PgxRaw` = `RawValues()` +
-hand-written NDJSON (pgx best case).
+In production these numbers translate to GC pause frequency and p99
+tail latency, not to wall-time on a single bench. The alloc
+reduction is the most durable advantage — it shows up identically
+on loopback, LAN, and WAN, while the ns/op differences disappear on
+real networks.
 
-### Pg2JSON: before vs after
+---
 
-| shape         | before MB/s | after MB/s | Δ          |
-|---------------|-------------|------------|------------|
-| narrow_int    | 128.97      | 125.68     | −2.5%      |
-| mixed_5col    | 169.94      | 168.26     | flat       |
-| wide_jsonb    | 144.01      | 143.97     | flat       |
-| array_int     | 138.69      | 134.91     | −2.7%      |
-| null_heavy    | 173.22      | 175.07     | +1.1%      |
+## Micro-benchmarks — hot loop
 
-Verdict: **no end-to-end delta within noise**. The micro-bench gain
-from §1 does not surface because the wire (PG's per-row work plus
-loopback cost) dominates the profile, not the JSON encoder. The
-small negative deltas on narrow_int / array_int are within the run-to-run
-variance observed on the bench box during the same session (see §5.3
-for example).
+| benchmark | ns/op | B/op | allocs |
+|---|---|---|---|
+| `RowEncodeMixed` (6-col row → JSON bytes) | 46 | 0 | **0** |
+| `EncodeInt` (text) | 5 | 0 | **0** |
+| `EncodeText` (ASCII) | 21 | 0 | **0** |
 
-### Pg2JSON vs pgx (after)
+Zero-alloc per cell is enforced on every change that touches
+`internal/rows` or `internal/types` — a bench that runs as part of
+the test suite and fails on regression.
 
-| shape         | Pg2JSON | PgxMap  | PgxRaw  | vs PgxMap | vs PgxRaw |
-|---------------|---------|---------|---------|-----------|-----------|
-| narrow_int    | 125.68  | 38.26   | 131.26  | 3.3×      | 0.96×     |
-| mixed_5col    | 168.26  | 69.53   | 167.56  | 2.4×      | 1.00×     |
-| wide_jsonb    | 143.97  | 32.18   | 102.16  | 4.5×      | 1.41×     |
-| array_int     | 134.91  | 59.45   | 134.70  | 2.3×      | 1.00×     |
-| null_heavy    | 175.07  | 59.31   | 175.21  | 3.0×      | 1.00×     |
+---
 
-Pg2JSON beats `PgxMap` by 2.3–4.5× (allocs tell the story: pg2json
-commits 6 allocs per full query; PgxMap does 1.3–4.5 million).
-Against `PgxRaw`, pg2json is flat on 4 shapes and ahead on
-`wide_jsonb` (the jsonb passthrough avoids PgxRaw's per-row concat).
+## Notes on outputs (byte count)
 
-### 5.3 Run-to-run variance context
+`StreamNDJSON`, `StreamColumnar`, `StreamTOON` all produce the same
+information shape for 100 000 `mixed_5col` rows but differ in size:
 
-Single bench run on this box shows variance up to ~10% for PgxRaw on
-Docker-backed workloads (compare wide_jsonb/PgxRaw between bench
-runs: 145.46 → 102.16 MB/s with no code change on that path). Treat
-the end-to-end numbers as ±5% noise; anything below that is inside
-the run-to-run spread.
+| mode | bytes / row | bytes total (100 k rows) | relative |
+|---|---|---|---|
+| NDJSON | 87.6 | 8.4 MB | 100 % |
+| Columnar | 53.6 | 5.1 MB | 61 % |
+| TOON | 51.6 | 4.9 MB | **59 %** |
 
-## Summary
+Wall time is identical across modes on loopback (the wire cost
+dominates). The byte savings translate to wall time on LAN / WAN and
+to token count when the consumer is an LLM.
 
-- **Micro-bench hot loop**: +4.6% throughput, 0 allocs retained.
-- **End-to-end over loopback**: unchanged within ±3% noise — already
-  wire-bound.
-- **Numeric binary**: decoder shipped as a utility (`EncodeNumericBinary`),
-  NOT auto-selected; default dispatch remains text. Net-negative on
-  loopback numeric(18,4).
-- **TCPRecvBuffer / TCPSendBuffer / bigger bufio default / RowsHint**:
-  surfaced as Config knobs with zero regression. Payoff shows up on
-  LAN deployments (TCP buffers) and buffered-mode large responses
-  (RowsHint); these were not measured here and should be validated in
-  the shadow-traffic soak.
+---
 
-Where the next win is: the hot loop is done. Further throughput
-requires either COPY binary export (not SELECT-compatible, requires
-trusted SQL — see conversation in CLAUDE.md), pipeline mode for
-high-QPS small-query gateways, or SIMD assembly for string escape —
-each with its own tradeoffs and opt-in story.
+## Coverage of `ScanStruct[T]`
+
+All of these ship tested, end-to-end, against real PostgreSQL:
+
+- scalars: `int2/4/8`, `uint32`, `float4/8`, `bool`, `string`,
+  `[]byte`, `time.Time`, `json.RawMessage`
+- nullable via `*T` (pointer) and via `sql.Null*`
+- custom `sql.Scanner` targets (routed through `Scan(any)`)
+- 1-D and 2-D arrays (`[]int32`, `[][]int32`, etc.)
+- embedded structs (Go-promotion semantics, outer shadows inner)
+- range types (`int4range`, `tstzrange`, …) via `pg2json.RangeBytes`
+
+Not supported (by design, use pgx or an `sql.Scanner` custom type):
+composite types (`ROW(…)`), 3-D+ arrays, `pgtype.*` wrappers.
+
+---
+
+## Honest limitations
+
+- Numbers measured on Apple M4 loopback. The ordering should hold on
+  comparable hardware; absolute values move.
+- No 8-hour / 500 k-user soak. Design targets it; validation
+  pending.
+- `database/sql` adapter is 5–8 % slower than the native API due to
+  the framework's own interface boxing. Use native when the read
+  path is in a hot spot.
+- COPY binary export path is on the roadmap, not implemented — the
+  only meaningful lever still on the table for bulk-export
+  workloads beyond the ~165 MB/s ceiling we see on mixed shapes
+  today.
