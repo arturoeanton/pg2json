@@ -339,7 +339,7 @@ func TestScanStructEmbeddedOverride(t *testing.T) {
 	}
 }
 
-func TestScanStructArrayMultiDimRejected(t *testing.T) {
+func TestScanStructArray2D(t *testing.T) {
 	dsn := os.Getenv("PG2JSON_TEST_DSN")
 	if dsn == "" {
 		t.Skip("PG2JSON_TEST_DSN not set")
@@ -350,9 +350,42 @@ func TestScanStructArrayMultiDimRejected(t *testing.T) {
 	type row struct {
 		Grid [][]int32
 	}
+	out, err := pg2json.ScanStruct[row](c, context.Background(),
+		"SELECT ARRAY[[1,2,3],[4,5,6]]::int4[] AS grid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("got %d rows", len(out))
+	}
+	g := out[0].Grid
+	if len(g) != 2 || len(g[0]) != 3 || len(g[1]) != 3 {
+		t.Fatalf("shape: %v", g)
+	}
+	want := [][]int32{{1, 2, 3}, {4, 5, 6}}
+	for i := range want {
+		for j := range want[i] {
+			if g[i][j] != want[i][j] {
+				t.Fatalf("g[%d][%d] = %d, want %d", i, j, g[i][j], want[i][j])
+			}
+		}
+	}
+}
+
+func TestScanStructArray3DRejected(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+	c := openClient(t)
+	defer c.Close()
+
+	type row struct {
+		Cube [][][]int32
+	}
 	_, err := pg2json.ScanStruct[row](c, context.Background(),
-		"SELECT ARRAY[[1,2],[3,4]]::int4[] AS grid")
+		"SELECT ARRAY[[[1]]]::int4[] AS cube")
 	if err == nil {
-		t.Fatalf("expected error for multi-dim array, got nil")
+		t.Fatalf("expected error for 3D array, got nil")
 	}
 }

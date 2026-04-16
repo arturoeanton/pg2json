@@ -1208,16 +1208,90 @@ func pickArraySetter(elemOID protocol.OID, format int16, targetType reflect.Type
 	if format != 1 {
 		return nil, fmt.Errorf("pg2json: array scan requires binary format (elem OID %d)", elemOID)
 	}
-	elemType := targetType.Elem()
-	if elemType.Kind() == reflect.Slice && elemType.Elem().Kind() != reflect.Uint8 {
-		return nil, fmt.Errorf("pg2json: multi-dim arrays not yet supported (target %s)", targetType)
+	// Count Go nesting depth (the target type's slice-of-slice
+	// rank) and resolve the leaf scalar element type. The inner
+	// element setter runs on the leaf; the outer loops build the
+	// nested slices. We cap at 2D for now because 3D+ requires more
+	// extensive testing with real PG workloads and is not in any
+	// reported use case.
+	goDepth := 0
+	leafType := targetType
+	for leafType.Kind() == reflect.Slice && leafType.Elem().Kind() == reflect.Slice &&
+		leafType.Elem().Elem().Kind() != reflect.Uint8 {
+		goDepth++
+		leafType = leafType.Elem()
 	}
-	elemSetter, err := pickSetter(elemOID, 1, elemType)
+	// leafType is now []scalar. One more unwrap to get the scalar.
+	if leafType.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("pg2json: array target must be a slice, got %s", targetType)
+	}
+	scalarType := leafType.Elem()
+	goDepth++ // the final []scalar level
+
+	if goDepth > 2 {
+		return nil, fmt.Errorf("pg2json: multi-dim arrays with Go depth > 2 not supported (target %s)", targetType)
+	}
+
+	elemSetter, err := pickSetter(elemOID, 1, scalarType)
 	if err != nil {
 		return nil, fmt.Errorf("pg2json: array element setter: %w", err)
 	}
-	elemSize := elemType.Size()
+	scalarSize := scalarType.Size()
 
+	if goDepth == 1 {
+		// 1D fast path — unchanged from the original implementation.
+		return func(fp unsafe.Pointer, raw []byte) error {
+			if raw == nil {
+				reflect.NewAt(targetType, fp).Elem().Set(reflect.Zero(targetType))
+				return nil
+			}
+			if len(raw) < 12 {
+				return fmt.Errorf("pg2json: array header truncated")
+			}
+			ndim := int32(binary.BigEndian.Uint32(raw[0:4]))
+			raw = raw[12:]
+			if ndim == 0 {
+				reflect.NewAt(targetType, fp).Elem().Set(reflect.MakeSlice(targetType, 0, 0))
+				return nil
+			}
+			if ndim != 1 {
+				return fmt.Errorf("pg2json: expected 1-dim array, got ndim=%d", ndim)
+			}
+			if len(raw) < 8 {
+				return fmt.Errorf("pg2json: array dim header truncated")
+			}
+			dimLen := int32(binary.BigEndian.Uint32(raw[0:4]))
+			raw = raw[8:]
+			if dimLen < 0 {
+				return fmt.Errorf("pg2json: negative array dim %d", dimLen)
+			}
+			sliceVal := reflect.MakeSlice(targetType, int(dimLen), int(dimLen))
+			reflect.NewAt(targetType, fp).Elem().Set(sliceVal)
+			if dimLen == 0 {
+				return nil
+			}
+			dataPtr := unsafe.Pointer(sliceVal.Index(0).UnsafeAddr())
+			for i := int32(0); i < dimLen; i++ {
+				elemRaw, rest, err := readArrayElem(raw, i)
+				if err != nil {
+					return err
+				}
+				raw = rest
+				elemPtr := unsafe.Pointer(uintptr(dataPtr) + uintptr(i)*scalarSize)
+				if err := elemSetter(elemPtr, elemRaw); err != nil {
+					return fmt.Errorf("pg2json: array element %d: %w", i, err)
+				}
+			}
+			return nil
+		}, nil
+	}
+
+	// 2D — outer [][]T from a PG ndim=2 array. Elements arrive flat
+	// in row-major order (outerIdx*innerLen + innerIdx). We allocate
+	// the outer slice of outerLen, then for each row allocate an
+	// inner slice of innerLen, fill, and store into the outer slot.
+	// goDepth == 2 guarantees targetType.Kind() == slice and
+	// targetType.Elem() == leafType == []scalar.
 	return func(fp unsafe.Pointer, raw []byte) error {
 		if raw == nil {
 			reflect.NewAt(targetType, fp).Elem().Set(reflect.Zero(targetType))
@@ -1227,50 +1301,64 @@ func pickArraySetter(elemOID protocol.OID, format int16, targetType reflect.Type
 			return fmt.Errorf("pg2json: array header truncated")
 		}
 		ndim := int32(binary.BigEndian.Uint32(raw[0:4]))
-		raw = raw[12:] // skip ndim + hasNulls + elemOID
+		raw = raw[12:]
 		if ndim == 0 {
-			// Zero-dim empty array.
 			reflect.NewAt(targetType, fp).Elem().Set(reflect.MakeSlice(targetType, 0, 0))
 			return nil
 		}
-		if ndim != 1 {
-			return fmt.Errorf("pg2json: multi-dim array not supported (ndim=%d)", ndim)
+		if ndim != 2 {
+			return fmt.Errorf("pg2json: 2D target requires ndim=2 PG array, got %d", ndim)
 		}
-		if len(raw) < 8 {
-			return fmt.Errorf("pg2json: array dim header truncated")
+		if len(raw) < 16 {
+			return fmt.Errorf("pg2json: 2D array dim headers truncated")
 		}
-		dimLen := int32(binary.BigEndian.Uint32(raw[0:4]))
-		raw = raw[8:] // skip dimLen + lowerBound
-		if dimLen < 0 {
-			return fmt.Errorf("pg2json: negative array dim %d", dimLen)
+		outerLen := int32(binary.BigEndian.Uint32(raw[0:4]))
+		innerLen := int32(binary.BigEndian.Uint32(raw[8:12]))
+		raw = raw[16:]
+		if outerLen < 0 || innerLen < 0 {
+			return fmt.Errorf("pg2json: negative 2D dim outer=%d inner=%d", outerLen, innerLen)
 		}
-		sliceVal := reflect.MakeSlice(targetType, int(dimLen), int(dimLen))
-		reflect.NewAt(targetType, fp).Elem().Set(sliceVal)
-		if dimLen == 0 {
-			return nil
-		}
-		dataPtr := unsafe.Pointer(sliceVal.Index(0).UnsafeAddr())
-		for i := int32(0); i < dimLen; i++ {
-			if len(raw) < 4 {
-				return fmt.Errorf("pg2json: array elem header truncated at %d", i)
+		outer := reflect.MakeSlice(targetType, int(outerLen), int(outerLen))
+		reflect.NewAt(targetType, fp).Elem().Set(outer)
+		for i := int32(0); i < outerLen; i++ {
+			inner := reflect.MakeSlice(leafType, int(innerLen), int(innerLen))
+			outer.Index(int(i)).Set(inner)
+			if innerLen == 0 {
+				continue
 			}
-			el := int32(binary.BigEndian.Uint32(raw[0:4]))
-			raw = raw[4:]
-			var elemRaw []byte
-			if el != -1 {
-				if el < 0 || int(el) > len(raw) {
-					return fmt.Errorf("pg2json: bad array elem length %d", el)
+			innerDataPtr := unsafe.Pointer(inner.Index(0).UnsafeAddr())
+			for j := int32(0); j < innerLen; j++ {
+				elemRaw, rest, err := readArrayElem(raw, i*innerLen+j)
+				if err != nil {
+					return err
 				}
-				elemRaw = raw[:el]
-				raw = raw[el:]
-			}
-			elemPtr := unsafe.Pointer(uintptr(dataPtr) + uintptr(i)*elemSize)
-			if err := elemSetter(elemPtr, elemRaw); err != nil {
-				return fmt.Errorf("pg2json: array element %d: %w", i, err)
+				raw = rest
+				elemPtr := unsafe.Pointer(uintptr(innerDataPtr) + uintptr(j)*scalarSize)
+				if err := elemSetter(elemPtr, elemRaw); err != nil {
+					return fmt.Errorf("pg2json: 2D element [%d][%d]: %w", i, j, err)
+				}
 			}
 		}
 		return nil
 	}, nil
+}
+
+// readArrayElem consumes one element header + body from a PG array
+// wire stream. Returns the element bytes (nil for NULL), the
+// remaining buffer, and an error on malformed input.
+func readArrayElem(raw []byte, idx int32) (elemRaw, rest []byte, err error) {
+	if len(raw) < 4 {
+		return nil, nil, fmt.Errorf("pg2json: array elem header truncated at %d", idx)
+	}
+	el := int32(binary.BigEndian.Uint32(raw[0:4]))
+	raw = raw[4:]
+	if el == -1 {
+		return nil, raw, nil
+	}
+	if el < 0 || int(el) > len(raw) {
+		return nil, nil, fmt.Errorf("pg2json: bad array elem length %d at %d", el, idx)
+	}
+	return raw[:el], raw[el:], nil
 }
 
 // --- sql.Scanner support -----------------------------------------------
