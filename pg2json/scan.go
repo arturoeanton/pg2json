@@ -227,38 +227,114 @@ const (
 	opByteCopyRaw // bytea / json / jsonb-stripped into []byte
 )
 
-func buildStructPlan(tType reflect.Type, plan *rows.Plan) (*structPlan, error) {
-	// Build a name -> field-index map so column resolution is O(1).
-	nameIdx := map[string]int{}
-	for i := 0; i < tType.NumField(); i++ {
-		f := tType.Field(i)
+// fieldRef points at a leaf struct field including any offset
+// contribution from enclosing anonymous (embedded) structs. It is
+// the plan-build-time answer to "which Go field does column X
+// target, and at what memory offset from the row base?".
+type fieldRef struct {
+	field  reflect.StructField
+	offset uintptr
+}
+
+// walkStructFields walks an entire struct tree — including any
+// anonymous (embedded) struct fields — and records every leaf
+// exported field under its resolved column name in `out`.
+//
+// Resolution rules:
+//   - `pg2json:"-"` skips the field entirely.
+//   - `pg2json:"name"` overrides the column name.
+//   - Anonymous struct fields are flattened automatically, EXCEPT
+//     when the embedded type is time.Time or the field has a
+//     pg2json tag (treat it as a single scalar).
+//   - Outer-declared fields win against embedded duplicates, so a
+//     leaf with the same resolved name defined directly on the
+//     outer struct takes precedence.
+//   - `seen` is threaded to break reference cycles defensively; in
+//     practice Postgres-row structs are acyclic but pointer-chains
+//     to self are possible in contrived cases.
+func walkStructFields(t reflect.Type, baseOffset uintptr, seen map[reflect.Type]bool, out map[string]fieldRef) {
+	if seen[t] {
+		return
+	}
+	seen[t] = true
+	defer delete(seen, t)
+
+	isEmbeddedFlatten := func(f reflect.StructField) bool {
+		tag, hasTag := f.Tag.Lookup("pg2json")
+		_ = tag
+		if hasTag {
+			return false
+		}
+		return f.Anonymous && f.Type.Kind() == reflect.Struct && !isTimeType(f.Type)
+	}
+
+	// Pass 1 — directly-declared (non-embedded) leaf fields at this
+	// level. These SHADOW any duplicate names surfaced by embedded
+	// structs, matching Go's own field-promotion rule ("shallower
+	// wins"). Unexported directly-declared fields are skipped as
+	// usual.
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag, hasTag := f.Tag.Lookup("pg2json")
+		if hasTag && tag == "-" {
+			continue
+		}
+		if isEmbeddedFlatten(f) {
+			continue
+		}
 		if !f.IsExported() {
 			continue
 		}
 		key := f.Name
-		if tag := f.Tag.Get("pg2json"); tag != "" && tag != "-" {
+		if hasTag && tag != "" {
 			key = tag
 		}
-		nameIdx[strings.ToLower(key)] = i
+		out[strings.ToLower(key)] = fieldRef{field: f, offset: baseOffset + f.Offset}
 	}
+
+	// Pass 2 — recurse into embedded structs. Resolve each
+	// embedded subtree independently, then merge only names not
+	// already claimed. Unexported anonymous struct types are
+	// flattened too: Go promotes their exported leaves regardless.
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag, hasTag := f.Tag.Lookup("pg2json")
+		if hasTag && tag == "-" {
+			continue
+		}
+		if !isEmbeddedFlatten(f) {
+			continue
+		}
+		inner := make(map[string]fieldRef)
+		walkStructFields(f.Type, baseOffset+f.Offset, seen, inner)
+		for k, v := range inner {
+			if _, exists := out[k]; !exists {
+				out[k] = v
+			}
+		}
+	}
+}
+
+func buildStructPlan(tType reflect.Type, plan *rows.Plan) (*structPlan, error) {
+	nameIdx := make(map[string]fieldRef, tType.NumField())
+	walkStructFields(tType, 0, map[reflect.Type]bool{}, nameIdx)
 
 	sp := &structPlan{setters: make([]fieldSetter, len(plan.Columns))}
 	for ci, col := range plan.Columns {
-		fi, ok := nameIdx[strings.ToLower(col.Name)]
+		info, ok := nameIdx[strings.ToLower(col.Name)]
 		if !ok {
 			sp.setters[ci].skip = true
 			continue
 		}
-		field := tType.Field(fi)
-		setter, err := pickSetter(col.TypeOID, col.Format, field.Type)
+		setter, err := pickSetter(col.TypeOID, col.Format, info.field.Type)
 		if err != nil {
 			return nil, fmt.Errorf("pg2json: column %q (OID %d) -> field %q (%s): %w",
-				col.Name, col.TypeOID, field.Name, field.Type, err)
+				col.Name, col.TypeOID, info.field.Name, info.field.Type, err)
 		}
 		sp.setters[ci] = fieldSetter{
-			offset: field.Offset,
+			offset: info.offset,
 			set:    setter,
-			op:     inlineOpFor(col.TypeOID, col.Format, field.Type),
+			op:     inlineOpFor(col.TypeOID, col.Format, info.field.Type),
 		}
 	}
 	return sp, nil

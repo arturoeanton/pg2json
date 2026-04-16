@@ -276,6 +276,69 @@ func TestScanStructBatchedCallbackError(t *testing.T) {
 	}
 }
 
+func TestScanStructEmbedded(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+	c := openClient(t)
+	defer c.Close()
+
+	type base struct {
+		Id int32
+	}
+	type rowFlat struct {
+		base // embedded anonymous struct; Id should flatten to "id"
+		Name string
+	}
+	out, err := pg2json.ScanStruct[rowFlat](c, context.Background(),
+		"SELECT id, name FROM bench_mixed_5col ORDER BY id LIMIT 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("got %d rows", len(out))
+	}
+	if out[0].Id != 1 || out[0].Name != "name-1" {
+		t.Fatalf("row[0]: %+v", out[0])
+	}
+	if out[1].Id != 2 || out[1].Name != "name-2" {
+		t.Fatalf("row[1]: %+v", out[1])
+	}
+}
+
+func TestScanStructEmbeddedOverride(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+	c := openClient(t)
+	defer c.Close()
+
+	// Both the embedded struct and the outer declare a field that
+	// resolves to the "id" column. Outer wins per the documented
+	// precedence rule.
+	type embedded struct {
+		Id int32
+	}
+	type rowShadow struct {
+		embedded
+		Id   int32 `pg2json:"id"` // outer Id wins
+		Name string
+	}
+	out, err := pg2json.ScanStruct[rowShadow](c, context.Background(),
+		"SELECT id, name FROM bench_mixed_5col ORDER BY id LIMIT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("got %d rows", len(out))
+	}
+	if out[0].Id != 1 || out[0].embedded.Id != 0 {
+		t.Fatalf("outer Id=%d, embedded.Id=%d (embedded should stay zero)", out[0].Id, out[0].embedded.Id)
+	}
+}
+
 func TestScanStructArrayMultiDimRejected(t *testing.T) {
 	dsn := os.Getenv("PG2JSON_TEST_DSN")
 	if dsn == "" {
