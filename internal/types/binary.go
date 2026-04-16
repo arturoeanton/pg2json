@@ -44,6 +44,13 @@ func PickBinary(oid protocol.OID) Encoder {
 		return encodeTimeBinary
 	case protocol.OIDTimeTZ:
 		return encodeTimeTZBinary
+	// OIDNumeric: a binary decoder exists in numeric_bin.go but is
+	// intentionally NOT auto-selected. On loopback and typical
+	// numeric(18,4) shapes the text path wins — PG's C-side formatter
+	// beats our Go decoder and the wire bytes are comparable. Wire it
+	// in (EncodeNumericBinaryForTest or via explicit config) when a
+	// workload shows text numeric dominating the profile (wide
+	// precision, high-RTT link, numeric-heavy queries).
 	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDBPChar,
 		protocol.OIDName, protocol.OIDBytea:
 		// For variable-length text-shaped types the binary format gives
