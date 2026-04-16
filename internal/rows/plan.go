@@ -31,6 +31,9 @@ type Plan struct {
 	// ColumnsArrayHeader is the JSON header for the columnar mode:
 	// `{"columns":["a","b"],"rows":[`
 	ColumnsArrayHeader []byte
+	// TOONHeader is the header for the TOON streaming mode:
+	// `[?]{col1,col2,...}\n`. Streamed row count is unknown hence `?`.
+	TOONHeader []byte
 }
 
 // ApplyFormats rewrites the encoder for each column to match the supplied
@@ -134,6 +137,7 @@ func ParseRowDescription(body []byte) (*Plan, error) {
 
 	p := &Plan{Columns: cols}
 	p.ColumnsArrayHeader = buildColumnsHeader(cols)
+	p.TOONHeader = buildTOONHeader(cols)
 	return p, nil
 }
 
@@ -157,4 +161,39 @@ func buildColumnsHeader(cols []Column) []byte {
 	}
 	buf = append(buf, ']', ',', '"', 'r', 'o', 'w', 's', '"', ':', '[')
 	return buf
+}
+
+// buildTOONHeader emits `[?]{col1,col2,...}\n`. Column names that are
+// plain (no comma, no whitespace, no control chars, no quote or
+// backslash) are emitted bare; anything else is JSON-quoted so the
+// consumer can parse the header unambiguously.
+func buildTOONHeader(cols []Column) []byte {
+	buf := make([]byte, 0, 8+len(cols)*12)
+	buf = append(buf, '[', '?', ']', '{')
+	for i, c := range cols {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		if nameNeedsQuote(c.Name) {
+			buf = jsonwriter.AppendString(buf, c.Name)
+		} else {
+			buf = append(buf, c.Name...)
+		}
+	}
+	buf = append(buf, '}', '\n')
+	return buf
+}
+
+func nameNeedsQuote(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= ' ' || c == ',' || c == '"' || c == '\\' ||
+			c == '{' || c == '}' || c == '[' || c == ']' {
+			return true
+		}
+	}
+	return false
 }

@@ -67,6 +67,7 @@ const (
 	ModeArray    Mode = iota // [{...},{...}]
 	ModeNDJSON               // {...}\n{...}\n
 	ModeColumnar             // {"columns":[...],"rows":[[...],[...]]}
+	ModeTOON                 // [?]{col1,col2}\nval1,val2\nval3,val4\n
 )
 
 // QueryJSON runs sql and returns a JSON array of objects in a single
@@ -97,6 +98,22 @@ func (c *Client) StreamNDJSON(ctx context.Context, w io.Writer, sql string, args
 // StreamColumnar streams the columnar form to w.
 func (c *Client) StreamColumnar(ctx context.Context, w io.Writer, sql string, args ...any) error {
 	return c.runQuery(ctx, c.newFlushWriter(w), ModeColumnar, sql, args)
+}
+
+// StreamTOON streams rows in TOON form to w:
+//
+//	[?]{col1,col2,...}
+//	val1,val2,...
+//	val3,val4,...
+//
+// Scalars are bare, strings JSON-escaped (`"..."`), json/jsonb are
+// emitted as raw JSON (parser must bracket-balance). Compared to
+// ModeNDJSON the keys are dropped so every row pays only for values +
+// commas + newline. For LLM / agent consumers the token savings are
+// substantial; for browser consumers this is a binary-compat break
+// from JSON — the caller must speak the format.
+func (c *Client) StreamTOON(ctx context.Context, w io.Writer, sql string, args ...any) error {
+	return c.runQuery(ctx, c.newFlushWriter(w), ModeTOON, sql, args)
 }
 
 func (c *Client) newFlushWriter(w io.Writer) *flushingWriter {
@@ -522,6 +539,9 @@ func writeHeader(out outWriter, mode Mode, plan *rows.Plan) error {
 	case ModeColumnar:
 		_, err := out.Write(plan.ColumnsArrayHeader)
 		return err
+	case ModeTOON:
+		_, err := out.Write(plan.TOONHeader)
+		return err
 	}
 	return nil
 }
@@ -552,6 +572,12 @@ func writeRow(out outWriter, mode Mode, plan *rows.Plan, body []byte, idx int) e
 		}
 		var err error
 		scratch, err = rows.AppendArray(scratch, body, plan)
+		if err != nil {
+			return err
+		}
+	case ModeTOON:
+		var err error
+		scratch, err = rows.AppendTOONRow(scratch, body, plan)
 		if err != nil {
 			return err
 		}
