@@ -204,6 +204,78 @@ func TestScanStructArray1D(t *testing.T) {
 	}
 }
 
+func TestScanStructBatched(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+	c := openClient(t)
+	defer c.Close()
+
+	type row struct {
+		Id   int32
+		Name string
+	}
+	// bench_mixed_5col has 100k rows — use batchSize 10 000 → 10 batches.
+	var totalRows int
+	var batchCount int
+	var firstID, lastID int32
+	err := pg2json.ScanStructBatched[row](c, context.Background(), 10000,
+		func(batch []row) error {
+			batchCount++
+			if batchCount == 1 {
+				firstID = batch[0].Id
+			}
+			lastID = batch[len(batch)-1].Id
+			totalRows += len(batch)
+			return nil
+		},
+		"SELECT id, name FROM bench_mixed_5col ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalRows != 100000 {
+		t.Fatalf("total rows %d, want 100000", totalRows)
+	}
+	if batchCount != 10 {
+		t.Fatalf("batches %d, want 10", batchCount)
+	}
+	if firstID != 1 || lastID != 100000 {
+		t.Fatalf("id range [%d, %d], want [1, 100000]", firstID, lastID)
+	}
+}
+
+func TestScanStructBatchedCallbackError(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+	c := openClient(t)
+	defer c.Close()
+
+	type row struct{ Id int32 }
+	sentinel := fmt.Errorf("stop here")
+	err := pg2json.ScanStructBatched[row](c, context.Background(), 100,
+		func(batch []row) error {
+			// Abort after the first batch.
+			return sentinel
+		},
+		"SELECT id FROM bench_mixed_5col ORDER BY id")
+	if err != sentinel {
+		t.Fatalf("expected sentinel error, got %v", err)
+	}
+	// Connection should still be usable.
+	type row2 struct{ Id int32 }
+	out, err := pg2json.ScanStruct[row2](c, context.Background(),
+		"SELECT id FROM bench_mixed_5col ORDER BY id LIMIT 3")
+	if err != nil {
+		t.Fatalf("reuse after abort: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("reuse got %d rows", len(out))
+	}
+}
+
 func TestScanStructArrayMultiDimRejected(t *testing.T) {
 	dsn := os.Getenv("PG2JSON_TEST_DSN")
 	if dsn == "" {

@@ -100,6 +100,87 @@ func castSlice[T any](rawSlice any) []T {
 	return rawSlice.([]T)
 }
 
+// ScanStructBatched is the memory-bounded variant of ScanStruct.
+//
+// Instead of materialising the full result set as []T, it calls cb with
+// a batch slice of up to batchSize rows, waits for cb to return, then
+// reuses the slice for the next batch. Memory use is O(batchSize *
+// sizeof(T)) regardless of the total row count — use it for queries
+// that would return millions of rows (audit logs, analytics exports,
+// bulk processing).
+//
+// The slice passed to cb aliases the internal buffer and is valid only
+// until cb returns. If cb needs to retain rows beyond that, it must
+// copy them. Returning a non-nil error from cb aborts the scan: pg2json
+// issues a server-side CancelRequest and drains to ReadyForQuery so
+// the connection is reusable.
+//
+// Returns io.EOF from cb for an early stop? No — return a distinguished
+// sentinel if you want to stop without reporting an error. Any non-nil
+// error is surfaced to the caller.
+func ScanStructBatched[T any](
+	c *Client, ctx context.Context,
+	batchSize int,
+	cb func(batch []T) error,
+	sql string, args ...any,
+) error {
+	if batchSize <= 0 {
+		return fmt.Errorf("pg2json: ScanStructBatched requires batchSize > 0")
+	}
+	if cb == nil {
+		return fmt.Errorf("pg2json: ScanStructBatched requires a non-nil callback")
+	}
+	if err := rejectNonSelect(sql); err != nil {
+		return err
+	}
+	if d := c.cfg.DefaultQueryTimeout; d > 0 {
+		if _, hasDL := ctx.Deadline(); !hasDL {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+	}
+	if err := c.attachContext(ctx); err != nil {
+		return err
+	}
+	defer c.detachContext()
+
+	var zero T
+	tType := reflect.TypeOf(zero)
+	if tType.Kind() != reflect.Struct {
+		return fmt.Errorf("pg2json: ScanStructBatched[T] requires T to be a struct, got %s", tType.Kind())
+	}
+	cbAny := func(batch any) error { return cb(batch.([]T)) }
+
+	for attempt := 0; attempt < 2; attempt++ {
+		st := c.stmts.get(sql)
+		fromCache := st != nil
+		if st == nil {
+			var err error
+			st, err = c.prepareAndDescribe(sql)
+			if err != nil {
+				c.stmts.invalidate(sql)
+				return err
+			}
+			c.stmts.put(sql, st)
+		}
+		sp, err := buildStructPlan(tType, st.plan)
+		if err != nil {
+			return err
+		}
+		err = c.bindExecuteScanBatched(st, args, sp, tType, batchSize, cbAny)
+		if err == nil {
+			return nil
+		}
+		if attempt == 0 && fromCache && isStaleStmtError(err) {
+			c.stmts.invalidate(sql)
+			continue
+		}
+		return err
+	}
+	return nil
+}
+
 // structPlan is the per-(ResultShape, T) plan. Built once per ScanStruct
 // call; for repeated queries on the same shape the RowDescription plan
 // is cached, but the struct plan itself is rebuilt each call. That is
@@ -264,6 +345,154 @@ func (c *Client) bindExecuteScan(st *preparedStmt, args []any, sp *structPlan, t
 		default:
 			return nil, fmt.Errorf("pg2json: unexpected msg %q during scan", t)
 		}
+	}
+}
+
+// bindExecuteScanBatched mirrors bindExecuteScan but flushes every
+// batchSize rows through cbAny instead of building one []T. The slice
+// is allocated once at batchSize capacity and reused — no growth, no
+// re-alloc, no reflect.Append. Memory remains O(batchSize).
+func (c *Client) bindExecuteScanBatched(
+	st *preparedStmt, args []any, sp *structPlan, tType reflect.Type,
+	batchSize int, cbAny func(any) error,
+) error {
+	bd := c.conn.Begin(protocol.MsgBind)
+	bd.CString("")
+	bd.CString(st.name)
+	bd.Int16(0)
+	bd.Int16(int16(len(args)))
+	for _, a := range args {
+		s, isNull, err := encodeArg(a)
+		if err != nil {
+			return err
+		}
+		if isNull {
+			bd.Int32(-1)
+		} else {
+			bd.Int32(int32(len(s)))
+			bd.String(s)
+		}
+	}
+	if allBinary(st.resultFmts) {
+		bd.Int16(1)
+		bd.Int16(1)
+	} else {
+		bd.Int16(int16(len(st.resultFmts)))
+		for _, f := range st.resultFmts {
+			bd.Int16(f)
+		}
+	}
+	bd.Finish()
+	ex := c.conn.Begin(protocol.MsgExecute)
+	ex.CString("")
+	ex.Int32(0)
+	ex.Finish()
+	c.conn.Begin(protocol.MsgSync).Finish()
+	if err := c.conn.Flush(); err != nil {
+		return err
+	}
+
+	sliceType := reflect.SliceOf(tType)
+	batch := reflect.MakeSlice(sliceType, batchSize, batchSize)
+	typeSize := tType.Size()
+	dataPtr := unsafe.Pointer(batch.Index(0).UnsafeAddr())
+
+	var pgError *pgerr.Error
+	var cbErr error
+	rowCount := 0 // within current batch
+	totalRows := 0
+
+	flush := func() error {
+		if rowCount == 0 {
+			return nil
+		}
+		if err := cbAny(batch.Slice(0, rowCount).Interface()); err != nil {
+			return err
+		}
+		// Zero the slots we just handed out so the next batch doesn't
+		// leak pointers from the previous one (strings, slices, maps,
+		// interface values — anything with a reference). For
+		// zero-reference structs this is cheap; for reference-heavy
+		// ones it keeps the GC honest.
+		clearBatchSlots(dataPtr, uintptr(rowCount)*typeSize)
+		rowCount = 0
+		return nil
+	}
+
+	for {
+		t, body, err := c.conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		switch t {
+		case protocol.MsgBindComplete:
+		case protocol.MsgDataRow:
+			if cbErr != nil {
+				// Already told the server to cancel — drain silently.
+				continue
+			}
+			rowPtr := unsafe.Pointer(uintptr(dataPtr) + uintptr(rowCount)*typeSize)
+			if err := fillStructRow(rowPtr, body, sp); err != nil {
+				return err
+			}
+			rowCount++
+			totalRows++
+			if rowCount == batchSize {
+				if err := flush(); err != nil {
+					cbErr = err
+					// Abort server-side so the connection stays usable.
+					cancelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					_ = c.SendCancel(cancelCtx)
+					cancel()
+				}
+			}
+		case protocol.MsgCommandComplete, protocol.MsgEmptyQueryResponse,
+			protocol.MsgPortalSuspended, protocol.MsgCloseComplete:
+		case protocol.MsgRowDescription:
+			newPlan, err := rows.ParseRowDescriptionForFormats(body, st.resultFmts)
+			if err != nil {
+				return err
+			}
+			st.plan = newPlan
+			newSP, err := buildStructPlan(tType, newPlan)
+			if err != nil {
+				return err
+			}
+			sp = newSP
+		case protocol.MsgNoticeResponse:
+			c.observer.OnNotice(pgerr.Parse(body))
+		case protocol.MsgParameterStatus:
+			k, v := splitParameter(body)
+			c.params[k] = v
+		case protocol.MsgErrorResponse:
+			pgError = pgerr.Parse(body)
+		case protocol.MsgReadyForQuery:
+			c.lastRows = totalRows
+			if cbErr != nil {
+				return cbErr
+			}
+			if pgError != nil {
+				return pgError
+			}
+			// Final partial batch.
+			return flush()
+		default:
+			return fmt.Errorf("pg2json: unexpected msg %q during batched scan", t)
+		}
+	}
+}
+
+// clearBatchSlots zeroes the first n bytes starting at p. Used between
+// batches so reference-typed fields (string headers, slice headers,
+// maps, interfaces) do not pin memory from the previous batch after cb
+// returns.
+func clearBatchSlots(p unsafe.Pointer, n uintptr) {
+	if n == 0 {
+		return
+	}
+	b := unsafe.Slice((*byte)(p), n)
+	for i := range b {
+		b[i] = 0
 	}
 }
 
