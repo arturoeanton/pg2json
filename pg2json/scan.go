@@ -190,11 +190,19 @@ func (c *Client) bindExecuteScan(st *preparedStmt, args []any, sp *structPlan, t
 		return nil, err
 	}
 
+	// Allocate capacity upfront, then advance a write-pointer by typeSize
+	// bytes per row. This avoids reflect.Append + reflect.Zero per row —
+	// the single biggest cell-level win we can get over the obvious
+	// implementation. Grows geometrically when capacity is exhausted.
 	sliceType := reflect.SliceOf(tType)
-	sliceVal := reflect.MakeSlice(sliceType, 0, 16)
+	initialCap := 16
 	if h := c.cfg.RowsHint; h > 0 {
-		sliceVal = reflect.MakeSlice(sliceType, 0, h)
+		initialCap = h
 	}
+	sliceVal := reflect.MakeSlice(sliceType, initialCap, initialCap)
+	typeSize := tType.Size()
+	dataPtr := unsafe.Pointer(sliceVal.Index(0).UnsafeAddr())
+	currentCap := initialCap
 
 	var pgError *pgerr.Error
 	rowCount := 0
@@ -206,11 +214,21 @@ func (c *Client) bindExecuteScan(st *preparedStmt, args []any, sp *structPlan, t
 		switch t {
 		case protocol.MsgBindComplete:
 		case protocol.MsgDataRow:
-			// Extend slice by one zero value, then fill fields via its
-			// base pointer. reflect.Append would realloc — Set on a grown
-			// slice avoids the per-row allocation once capacity is hit.
-			sliceVal = reflect.Append(sliceVal, reflect.Zero(tType))
-			rowPtr := unsafe.Pointer(sliceVal.Index(rowCount).UnsafeAddr())
+			if rowCount == currentCap {
+				// Grow 2x, copy existing bytes, update dataPtr. MakeSlice
+				// zeroes the tail so the freshly-revealed rows start
+				// zero-valued — matches what reflect.Zero provided before.
+				newCap := currentCap * 2
+				newSliceVal := reflect.MakeSlice(sliceType, newCap, newCap)
+				newDataPtr := unsafe.Pointer(newSliceVal.Index(0).UnsafeAddr())
+				src := unsafe.Slice((*byte)(dataPtr), currentCap*int(typeSize))
+				dst := unsafe.Slice((*byte)(newDataPtr), newCap*int(typeSize))
+				copy(dst, src)
+				sliceVal = newSliceVal
+				dataPtr = newDataPtr
+				currentCap = newCap
+			}
+			rowPtr := unsafe.Pointer(uintptr(dataPtr) + uintptr(rowCount)*typeSize)
 			if err := fillStructRow(rowPtr, body, sp); err != nil {
 				return nil, err
 			}
@@ -241,7 +259,8 @@ func (c *Client) bindExecuteScan(st *preparedStmt, args []any, sp *structPlan, t
 			if pgError != nil {
 				return nil, pgError
 			}
-			return sliceVal.Interface(), nil
+			// Trim the over-allocated tail to the real row count.
+			return sliceVal.Slice(0, rowCount).Interface(), nil
 		default:
 			return nil, fmt.Errorf("pg2json: unexpected msg %q during scan", t)
 		}
