@@ -1,0 +1,34 @@
+services:
+  pg:
+    image: postgres:17-alpine
+    container_name: pg2json-bench
+    environment:
+      POSTGRES_USER: pgopt
+      POSTGRES_PASSWORD: pgopt
+      POSTGRES_DB: pgopt
+      # Tuning for a bench box. Nothing exotic — just so we're not
+      # comparing drivers on a default 128 MB shared_buffers.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "full_page_writes=off"
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "pgopt"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
