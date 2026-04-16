@@ -20,6 +20,14 @@ import (
 // The hot loop runs per DataRow and this is the single biggest cell-level
 // win we can bank without SIMD. The only shared helper is the bounds
 // guard; keep the decoding arithmetic here.
+//
+// A plan-bytecode variant (inline switch on a per-column opcode) was
+// prototyped and measured flat-to-slightly-negative on both the mixed
+// micro-bench (49.3 ns/op vs 46.2 ns/op) and the live 100k-row shapes
+// (-1 to -2% on covered shapes, within run-to-run noise). With a warm
+// branch predictor the func-pointer Encoder is already close to free;
+// the switch overhead did not pay back. Reverted. See git history if
+// you want to re-explore with SIMD or per-shape codegen.
 func AppendObject(dst, body []byte, plan *Plan) ([]byte, error) {
 	cols := plan.Columns
 	if len(body) < 2 {
