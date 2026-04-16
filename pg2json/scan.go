@@ -754,6 +754,9 @@ func pickSetter(oid protocol.OID, format int16, targetType reflect.Type) (func(u
 	if setter, ok := pickScannerSetter(oid, format, targetType); ok {
 		return setter, nil
 	}
+	if setter, ok := pickRangeSetter(oid, format, targetType); ok {
+		return setter, nil
+	}
 	// Array target: slice with PG array OID on the wire. Excludes
 	// []byte (handled as bytea in the binary path) so `text[]` into
 	// `[]byte` still fails loudly.
@@ -1187,6 +1190,109 @@ func nullSetterWrap(inner func(unsafe.Pointer, []byte) error, validOff uintptr) 
 		*validPtr = true
 		return nil
 	}
+}
+
+// --- Range type support -----------------------------------------------
+//
+// RangeBytes captures a PostgreSQL range value in its raw wire form:
+// the two bound bytes plus the flags that say whether each bound is
+// inclusive, exclusive, or infinite (open on that side). The inner
+// bound bytes arrive in the same binary encoding as the element type
+// — int4 for int4range, int8 for int8range, timestamp for tsrange,
+// etc. Decoding them further is the caller's job because the shape
+// varies per range kind; `pg2json.DriverValueDecoder(oid, 1)(raw)`
+// on each bound field is the usual path.
+//
+// Wire layout, reference: src/backend/utils/adt/rangetypes.c
+// (range_send / range_recv):
+//
+//	uint8 flags
+//	if !empty && !lower_inf: int32 lower_len, bytes
+//	if !empty && !upper_inf: int32 upper_len, bytes
+//
+// Flag bits:
+//
+//	0x01 empty
+//	0x02 lower-bound inclusive
+//	0x04 upper-bound inclusive
+//	0x08 lower bound is -infinity (no bytes follow for it)
+//	0x10 upper bound is +infinity
+//
+// For callers that want a typed bound (time.Time, int64, etc.) an
+// idiomatic sql.Scanner on a user-defined range type also works:
+// pg2json's scanner dispatch passes the full raw wire body when the
+// OID is not in the canonical set.
+type RangeBytes struct {
+	Flags          uint8
+	Lower          []byte // nil if LowerInfinite or Empty
+	Upper          []byte // nil if UpperInfinite or Empty
+	Empty          bool
+	LowerInclusive bool
+	UpperInclusive bool
+	LowerInfinite  bool
+	UpperInfinite  bool
+}
+
+var rangeBytesType = reflect.TypeOf(RangeBytes{})
+
+func pickRangeSetter(oid protocol.OID, format int16, t reflect.Type) (func(unsafe.Pointer, []byte) error, bool) {
+	if format != 1 {
+		return nil, false
+	}
+	if !protocol.IsRange(oid) {
+		return nil, false
+	}
+	if t != rangeBytesType {
+		return nil, false
+	}
+	return func(fp unsafe.Pointer, raw []byte) error {
+		rb := (*RangeBytes)(fp)
+		if raw == nil {
+			*rb = RangeBytes{}
+			return nil
+		}
+		if len(raw) < 1 {
+			return fmt.Errorf("pg2json: range wire body empty")
+		}
+		flags := raw[0]
+		rb.Flags = flags
+		rb.Empty = flags&0x01 != 0
+		rb.LowerInclusive = flags&0x02 != 0
+		rb.UpperInclusive = flags&0x04 != 0
+		rb.LowerInfinite = flags&0x08 != 0
+		rb.UpperInfinite = flags&0x10 != 0
+		rb.Lower = nil
+		rb.Upper = nil
+		if rb.Empty {
+			return nil
+		}
+		body := raw[1:]
+		if !rb.LowerInfinite {
+			if len(body) < 4 {
+				return fmt.Errorf("pg2json: range lower header truncated")
+			}
+			ll := int32(binary.BigEndian.Uint32(body[0:4]))
+			body = body[4:]
+			if ll < 0 || int(ll) > len(body) {
+				return fmt.Errorf("pg2json: bad range lower length %d", ll)
+			}
+			rb.Lower = append([]byte(nil), body[:ll]...)
+			body = body[ll:]
+		}
+		if !rb.UpperInfinite {
+			if len(body) < 4 {
+				return fmt.Errorf("pg2json: range upper header truncated")
+			}
+			ul := int32(binary.BigEndian.Uint32(body[0:4]))
+			body = body[4:]
+			if ul < 0 || int(ul) > len(body) {
+				return fmt.Errorf("pg2json: bad range upper length %d", ul)
+			}
+			rb.Upper = append([]byte(nil), body[:ul]...)
+			body = body[ul:]
+		}
+		return nil
+	}, true
 }
 
 // --- PG array support --------------------------------------------------

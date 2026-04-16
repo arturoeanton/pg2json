@@ -48,7 +48,27 @@ const (
 	OIDJSONArray        OID = 199
 	OIDJSONBArray       OID = 3807
 	OIDNumericArray     OID = 1231
+
+	// Range types (pg_type.dat).
+	OIDInt4Range    OID = 3904
+	OIDNumRange     OID = 3906
+	OIDTsRange      OID = 3908
+	OIDTsTzRange    OID = 3910
+	OIDDateRange    OID = 3912
+	OIDInt8Range    OID = 3926
 )
+
+// IsRange reports whether oid names a PostgreSQL range type we
+// recognise. Range types share a common wire format (flags byte +
+// optional lower/upper bounds) regardless of the element type, so
+// the decoder does not need to dispatch further on the element OID.
+func IsRange(o OID) bool {
+	switch o {
+	case OIDInt4Range, OIDInt8Range, OIDNumRange, OIDTsRange, OIDTsTzRange, OIDDateRange:
+		return true
+	}
+	return false
+}
 
 // ArrayElem returns the element OID for the given array OID, or 0 if the
 // OID is not a recognised array type.

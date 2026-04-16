@@ -372,6 +372,70 @@ func TestScanStructArray2D(t *testing.T) {
 	}
 }
 
+func TestScanStructRangeBytes(t *testing.T) {
+	dsn := os.Getenv("PG2JSON_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG2JSON_TEST_DSN not set")
+	}
+	c := openClient(t)
+	defer c.Close()
+
+	type row struct {
+		R pg2json.RangeBytes `pg2json:"r"`
+	}
+
+	// Bounded [1, 5) — lower inclusive, upper exclusive.
+	out, err := pg2json.ScanStruct[row](c, context.Background(),
+		"SELECT '[1,5)'::int4range AS r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := out[0].R
+	if r.Empty {
+		t.Fatal("expected non-empty")
+	}
+	if !r.LowerInclusive || r.UpperInclusive {
+		t.Fatalf("inclusivity wrong: %+v", r)
+	}
+	if r.LowerInfinite || r.UpperInfinite {
+		t.Fatalf("infinity wrong: %+v", r)
+	}
+	// Lower bound = 1 as int4 binary = 4 bytes.
+	if len(r.Lower) != 4 || r.Lower[3] != 1 {
+		t.Fatalf("lower bytes: %v", r.Lower)
+	}
+	if len(r.Upper) != 4 || r.Upper[3] != 5 {
+		t.Fatalf("upper bytes: %v", r.Upper)
+	}
+
+	// Empty range.
+	out2, err := pg2json.ScanStruct[row](c, context.Background(),
+		"SELECT 'empty'::int4range AS r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out2[0].R.Empty {
+		t.Fatalf("expected empty, got %+v", out2[0].R)
+	}
+
+	// Upper infinite: [1,).
+	out3, err := pg2json.ScanStruct[row](c, context.Background(),
+		"SELECT int4range(1, NULL) AS r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r3 := out3[0].R
+	if !r3.UpperInfinite || r3.Empty || r3.LowerInfinite {
+		t.Fatalf("upper-inf shape: %+v", r3)
+	}
+	if len(r3.Lower) != 4 || r3.Lower[3] != 1 {
+		t.Fatalf("lower bytes on upper-inf: %v", r3.Lower)
+	}
+	if r3.Upper != nil {
+		t.Fatalf("upper must be nil when infinite, got %v", r3.Upper)
+	}
+}
+
 func TestScanStructArray3DRejected(t *testing.T) {
 	dsn := os.Getenv("PG2JSON_TEST_DSN")
 	if dsn == "" {

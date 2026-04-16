@@ -51,6 +51,15 @@ func PickBinary(oid protocol.OID) Encoder {
 	// in (EncodeNumericBinaryForTest or via explicit config) when a
 	// workload shows text numeric dominating the profile (wide
 	// precision, high-RTT link, numeric-heavy queries).
+	case protocol.OIDInt4Range, protocol.OIDInt8Range, protocol.OIDNumRange,
+		protocol.OIDTsRange, protocol.OIDTsTzRange, protocol.OIDDateRange:
+		// Range types: request binary so struct scan can decode into
+		// pg2json.RangeBytes. For the JSON output paths we fall back
+		// to EncodeString, which wraps the raw bounds in a quoted
+		// JSON string — not beautiful but safe. Callers that want a
+		// rendered range in JSON should decode to RangeBytes + a
+		// custom Marshal.
+		return EncodeString
 	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDBPChar,
 		protocol.OIDName, protocol.OIDBytea:
 		// For variable-length text-shaped types the binary format gives
