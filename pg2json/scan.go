@@ -1084,6 +1084,15 @@ func pickArraySetter(elemOID protocol.OID, format int16, targetType reflect.Type
 // Scanner implementation does. Still faster than pgx's full pgtype
 // layer for custom types.
 
+// DriverValueDecoder returns a decoder that converts the raw wire
+// bytes of a cell to the canonical driver.Value that database/sql
+// expects: int64 / float64 / bool / []byte / string / time.Time, or
+// nil on NULL. Used by the pg2json/stdlib adapter; callers of the
+// native API typically do not need this.
+func DriverValueDecoder(oid uint32, format int16) func([]byte) any {
+	return scannerDecoderFor(protocol.OID(oid), format)
+}
+
 var scannerInterfaceType = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
 
 func pickScannerSetter(oid protocol.OID, format int16, targetType reflect.Type) (func(unsafe.Pointer, []byte) error, bool) {

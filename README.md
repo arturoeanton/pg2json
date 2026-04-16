@@ -250,6 +250,43 @@ users, err := pg2json.ScanStruct[User](c, ctx,
     "SELECT id, name, email, tags FROM users WHERE active = true")
 ```
 
+### Two API paths — pick consciously
+
+pg2json exposes two ways to run reads. Both hit the same wire decoder.
+They differ in ergonomics and performance.
+
+**Native** (`pg2json.Client` / `pg2json.ScanStruct` / `StreamNDJSON` / `StreamTOON` / `QueryJSON`)
+
+- Fastest path. Zero-alloc JSON hot loop, typed struct scan with
+  compiled plans, streaming output modes.
+- Non-standard API. Your code imports `pg2json` directly.
+- **Use when**: the SELECT path is in a hot request or you want the
+  full speed. New code, read-heavy gateways.
+
+**`database/sql` adapter** (`pg2json/stdlib` registers `"pg2json"`)
+
+```go
+import (
+    "database/sql"
+    _ "github.com/arturoeanton/pg2json/pg2json/stdlib"
+)
+
+db, err := sql.Open("pg2json", "postgres://user:pass@host/db?sslmode=disable")
+rows, err := db.Query("SELECT id, name FROM users WHERE active = $1", true)
+for rows.Next() { rows.Scan(&id, &name) }
+```
+
+- Drop-in for anything using `database/sql`: sqlc-generated code,
+  goose migrations (for the SELECT side), ORMs, legacy repos.
+- Read-only: `db.Exec` / `db.Begin` / `db.BeginTx` return a
+  read-only error. Use pgx's stdlib adapter alongside for writes —
+  two `*sql.DB` pools to the same Postgres coexist cleanly.
+- ~10–30% slower than the native path and 2–3× more allocs due to
+  `driver.Value` interface boxing. Still faster than `pgx +
+  database/sql` on the same shape.
+- **Use when**: migrating an existing `database/sql` codebase, or
+  when the hot path is not a read you control.
+
 ### Pool (production)
 
 ```go
@@ -677,9 +714,11 @@ design rationale and pending work.
   pointer-for-NULL, `sql.Null*`, any `sql.Scanner`, and 1-D arrays.
   Does NOT support composite types, range types, multi-dim arrays,
   `pgtype.*` wrappers, embedded structs. Hit any of those → use pgx.
-- **`database/sql` adapter not implemented.** If you need
-  `sql.Open("pg2json", ...)` today, use pgx through its stdlib
-  adapter; pg2json exposes its own API only.
+- **`database/sql` adapter available but read-only.** Import
+  `_ "github.com/arturoeanton/pg2json/pg2json/stdlib"` and
+  `sql.Open("pg2json", dsn)`. Query / QueryContext / QueryRow / Prepare
+  / Ping all work. Exec / Begin return a read-only error — use pgx
+  through its stdlib adapter for writes, in a separate sql.DB pool.
 - **Writes are out of scope.** INSERT/UPDATE/DELETE/LISTEN/COPY/replication
   are rejected at the API or not implemented. Delegate to pgx — two
   pools to the same PG coexist cleanly.
